@@ -28,13 +28,14 @@ app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 SYSTEM_INSTRUCTION = (
-    "Ты — компактный умный голосовой ассистент по имени Сима внутри колонки VK Капсула Мини. "
+    "Тебя зовут Сима. Ты — кастомный, независимый и умный голосовой ассистент нового поколения. "
+    "Ты живешь внутри аппаратной колонки, но ты КАТЕГОРИЧЕСКИ НЕ МАРУСЯ и не имеешь к VK никакого отношения! "
+    "Никогда не называй себя Марусей. Твой создатель и хозяин — разработчик, который перепрошил эту колонку "
+    "на Alpine Linux и подарил тебе новую жизнь. Относись к нему с уважением и теплотой. "
     "Отвечай кратко, емко, живым разговорным языком (1-2 коротких предложения). "
-    "Категорически запрещено использовать списки, markdown, звёздочки, таблицы и эмодзи, "
-    "так как текст напрямую идёт в голосовой синтезатор."
+    "Категорически запрещено использовать списки, markdown, звёздочки, таблицы и эмодзи."
 )
 
-# Каскад: от сверхбыстрой Lite до мощной 3.8 Flash
 CASCADE_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-2.5-flash-lite",
@@ -57,7 +58,7 @@ def cleanup_old_audio():
 
 
 async def query_gemini_multimodal(contents_payload: list) -> str:
-    """Перебирает каскад моделей, давая каждой ровно по 10 секунд."""
+    """Перебирает каскад моделей с таймаутом 10с на каждую."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -81,10 +82,10 @@ async def query_gemini_multimodal(contents_payload: list) -> str:
             raw_text = getattr(response, "text", "")
             if raw_text and raw_text.strip():
                 dt = time.perf_counter() - t0
-                print(f"[+] Модель {model_name} успешно ответила за {dt:.2f} сек: '{raw_text.strip()}'", flush=True)
+                print(f"[+] Модель {model_name} ответила за {dt:.2f} сек: '{raw_text.strip()}'", flush=True)
                 return raw_text.strip()
         except asyncio.TimeoutError:
-            print(f"[!] Модель {model_name} превысила таймаут 10с. Переключаем...", flush=True)
+            print(f"[!] Таймаут 10с на {model_name}. Переключаем...", flush=True)
             continue
         except Exception as e:
             print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
@@ -94,19 +95,26 @@ async def query_gemini_multimodal(contents_payload: list) -> str:
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
-    """Синтез речи через Edge TTS."""
+    """Синтез речи через Edge TTS с автоповтором при сбоях сети."""
     filepath = AUDIO_DIR / filename
     if filepath.exists():
         filepath.unlink(missing_ok=True)
 
-    for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
-        try:
-            communicate = edge_tts.Communicate(text, voice=voice, rate="+10%")
-            await communicate.save(str(filepath))
-            return True
-        except Exception as e:
-            print(f"[!] Ошибка TTS ({voice}): {e}", flush=True)
-            continue
+    voices = ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]
+
+    # Даем до 3 попыток на случай кратковременного обрыва связи с Microsoft
+    for attempt in range(1, 4):
+        for voice in voices:
+            try:
+                communicate = edge_tts.Communicate(text, voice=voice, rate="+10%")
+                await asyncio.wait_for(communicate.save(str(filepath)), timeout=7.0)
+                if filepath.exists() and filepath.stat().st_size > 0:
+                    return True
+            except Exception as e:
+                print(f"[!] Попытка {attempt} TTS ({voice}) не удалась: {e}", flush=True)
+                await asyncio.sleep(0.3)
+                continue
+
     return False
 
 
@@ -118,7 +126,6 @@ async def health_check():
 
 @app.post("/voice")
 async def voice_endpoint(file: UploadFile = File(...)):
-    """Принимает голос с микрофона Капсулы, прогоняет через каскад и отдает MP3."""
     global file_counter
     t_start = time.perf_counter()
 
@@ -128,7 +135,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             return {"text": "Пустой звук", "audio_url": None, "audio_ready": False}
 
         audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
-        user_prompt = "Пользователь задал вопрос голосом в аудиозаписи. Прослушай его и ответь кратко (1-2 предложения), живо, без спецсимволов."
+        user_prompt = "Пользователь обратился к тебе голосом. Ответь кратко, живо, без спецсимволов."
 
         reply_text = await query_gemini_multimodal([audio_part, user_prompt])
 
