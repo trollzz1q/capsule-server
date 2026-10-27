@@ -6,5 +6,6 @@ websockets
 aiofiles
 python-dotenv
 google-genai
-edge-tts
 faster-whisper
+torch
+torchaudio
