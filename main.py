@@ -32,20 +32,25 @@ SYSTEM_PROMPT = (
 )
 
 FAST_MODELS = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-flash-latest"
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
 ]
 
-
 async def ask_gemini(user_text: str) -> str:
-    full_prompt = f"{SYSTEM_PROMPT}\nВопрос пользователя: {user_text}"
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    global client
+    if not GEMINI_API_KEY:
+        return "ОШИБКА: GEMINI_API_KEY не задан в .env"
 
-    for model_name in models_to_try:
+    if client is None:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+    full_prompt = f"{SYSTEM_PROMPT}\nВопрос пользователя: {user_text}"
+    last_error = "Неизвестная ошибка"
+
+    for model_name in FAST_MODELS:
         t0 = time.perf_counter()
         try:
-            # Корректный асинхронный вызов генерации в google-genai
+            print(f"[*] Запрос к {model_name}...", flush=True)
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
@@ -55,16 +60,18 @@ async def ask_gemini(user_text: str) -> str:
             )
             dt = time.perf_counter() - t0
             if response and response.text:
-                print(f"[+] {model_name} ответила за {dt:.2f} сек")
+                print(f"[+] {model_name} ответила за {dt:.2f} сек", flush=True)
                 return response.text.strip()
         except asyncio.TimeoutError:
-            print(f"[!] Таймаут модели {model_name}")
-            continue
+            last_error = f"TimeoutError ({model_name})"
+            print(f"[!] {last_error}", flush=True)
         except Exception as e:
-            print(f"[!] Ошибка вызова {model_name}: {e}")
-            continue
+            # Сохраняем точный текст исключения Google API
+            last_error = f"{model_name} -> {repr(e)}"
+            print(f"[!] Сбой вызова {last_error}", flush=True)
 
-    return "Сервер перегружен, спроси чуть позже."
+    # Вместо заглушки возвращаем точную ошибку прямо в чат/клиент:
+    return f"ОШИБКА_API: {last_error}"
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
