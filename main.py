@@ -15,7 +15,7 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Контекстный диалог). Gemini: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (Реальный поиск Google + Контекст). API: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -37,8 +37,9 @@ SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный, дружелюбный и эрудированный голосовой ассистент смарт-колонки. "
     "Отвечай строго на русском языке! "
     "Давай полные, интересные, умные и живые ответы (2-4 предложения). "
-    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух. "
-    "Помни контекст текущего диалога с пользователем."
+    "У тебя есть доступ к поиску Google в реальном времени. Если пользователь спрашивает о погоде, "
+    "новостях или текущих фактах — обязательно используй поиск и давай точную температуру и прогноз! "
+    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух."
 )
 
 CASCADE_MODELS = [
@@ -49,8 +50,6 @@ CASCADE_MODELS = [
 ]
 
 file_counter = 0
-
-# --- СИСТЕМА ПАМЯТИ ДИАЛОГА ---
 chat_history: list[types.Content] = []
 last_interaction_time: float = 0.0
 
@@ -66,21 +65,17 @@ def cleanup_old_audio():
 
 
 def get_history_with_query(user_query: str) -> list[types.Content]:
-    """Удерживает контекст диалога. Сбрасывает при паузе > 60 секунд."""
     global chat_history, last_interaction_time
     now = time.time()
 
-    # Если прошло больше минуты — начинаем диалог с чистого листа
     if now - last_interaction_time > 60.0:
         chat_history = []
-        print("[*] Контекст сброшен по таймауту неактивности (60с).", flush=True)
+        print("[*] Контекст сброшен по таймауту (60с).", flush=True)
 
     last_interaction_time = now
-
     chat_history.append(
         types.Content(role="user", parts=[types.Part.from_text(text=user_query)])
     )
-    # Держим в памяти до 8 последних реплик
     if len(chat_history) > 8:
         chat_history = chat_history[-8:]
 
@@ -88,7 +83,6 @@ def get_history_with_query(user_query: str) -> list[types.Content]:
 
 
 def append_assistant_reply(reply_text: str):
-    """Сохраняет ответ Симы в память."""
     global chat_history
     chat_history.append(
         types.Content(role="model", parts=[types.Part.from_text(text=reply_text)])
@@ -102,7 +96,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, города, погода, музыка.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, города России, Новороссийск, погода.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -115,7 +109,6 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_with_context(user_query: str) -> str:
-    """Генерация с учетом контекста беседы."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -124,24 +117,26 @@ async def query_gemini_with_context(user_query: str) -> str:
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
         try:
+            # Включаем поиск Google Grounding для погоды и фактов реального времени
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
                     contents=full_context_contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
-                        max_output_tokens=300,
+                        tools=[types.Tool(google_search=types.GoogleSearch())],  # РЕАЛЬНЫЙ ПОИСК GOOGLE!
+                        max_output_tokens=350,
                         temperature=0.7,
                     )
                 ),
-                timeout=12.0
+                timeout=14.0
             )
 
             raw_text = getattr(response, "text", "")
             if raw_text:
                 clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
-                print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
+                print(f"[+] {model_name} с поиском ({dt:.2f}с): '{clean_text}'", flush=True)
                 append_assistant_reply(clean_text)
                 return clean_text
 
@@ -163,8 +158,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
-        except Exception as e:
-            print(f"[!] Ошибка озвучки ({voice}): {e}", flush=True)
+        except Exception:
             continue
     return False
 
@@ -172,14 +166,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "context_turns": len(chat_history)}
-
-
-@app.post("/reset")
-async def reset_context():
-    global chat_history
-    chat_history = []
-    return {"status": "ok", "message": "Контекст диалога очищен"}
+    return {"status": "ok", "service": "capsule-server", "search": "enabled"}
 
 
 @app.post("/voice")
