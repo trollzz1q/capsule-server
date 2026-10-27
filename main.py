@@ -18,7 +18,12 @@ print(f"[*] Старт сервера. Ключ API найден: {bool(GEMINI_A
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Инициализируем клиент без риска уронить весь сервис
+try:
+    client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+except Exception as e:
+    print(f"[!] Предупреждение: ошибка инициализации Google GenAI: {e}", flush=True)
+    client = None
 
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
@@ -32,28 +37,31 @@ SYSTEM_INSTRUCTION = (
 
 MODEL_NAME = "gemini-3.8-flash"
 
-# Глобальный чат для удержания памяти/контекста диалога
 global_chat = None
 file_counter = 0
 
 
 def get_chat():
-    """Возвращает или создает активный чат с Симой для сохранения памяти диалога."""
+    """Возвращает или создает активный чат с Симой."""
     global global_chat
     if client and global_chat is None:
-        global_chat = client.aio.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                max_output_tokens=75,
-                temperature=0.7,
-            ),
-        )
+        try:
+            global_chat = client.aio.chats.create(
+                model=MODEL_NAME,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    max_output_tokens=75,
+                    temperature=0.7,
+                ),
+            )
+        except Exception as e:
+            print(f"[!] Ошибка создания чата: {e}", flush=True)
+            return None
     return global_chat
 
 
 def cleanup_old_audio():
-    """Удаляет аудиофайлы старше 5 минут, чтобы диск сервера не забивался."""
+    """Удаляет аудиофайлы старше 5 минут."""
     now = time.time()
     for f in AUDIO_DIR.glob("reply_*.mp3"):
         try:
@@ -81,7 +89,9 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 
 
 @app.get("/")
-async def root():
+@app.get("/health")
+async def health_check():
+    """Эндпоинт проверки здоровья контейнера для хостинга."""
     return {"status": "ok", "service": "capsule-server", "model": MODEL_NAME}
 
 
@@ -96,21 +106,19 @@ async def reset_context():
 
 @app.post("/voice")
 async def voice_endpoint(file: UploadFile = File(...)):
-    """Принимает голос с микрофона Капсулы через curl, обрабатывает в Gemini и возвращает MP3."""
+    """Принимает голос с микрофона Капсулы, отправляет в Gemini и возвращает MP3."""
     global file_counter
     t_start = time.perf_counter()
 
     try:
-        # Читаем аудиобайты прямо из потока без временных файлов на диске
         audio_bytes = await file.read()
         if not audio_bytes:
-            return {"text": "Пустой звук", "audio_url": None}
+            return {"text": "Пустой звук", "audio_url": None, "audio_ready": False}
 
         chat = get_chat()
         if not chat:
             reply_text = "В настройках сервера не указан API-ключ."
         else:
-            # Передаем аудиофайл как инлайн-часть напрямую в модель
             audio_part = types.Part.from_bytes(
                 data=audio_bytes,
                 mime_type="audio/wav"
@@ -124,8 +132,9 @@ async def voice_endpoint(file: UploadFile = File(...)):
                 chat.send_message([audio_part, prompt]),
                 timeout=10.0
             )
-            reply_text = response.text.strip()
-            print(f"[+] Сима услышала вопрос и ответила: '{reply_text}'", flush=True)
+            raw_text = getattr(response, "text", "")
+            reply_text = raw_text.strip() if raw_text else "Я тебя услышала."
+            print(f"[+] Сима ответила: '{reply_text}'", flush=True)
 
     except asyncio.TimeoutError:
         print("[!] Таймаут ответа Gemini по голосу", flush=True)
@@ -134,7 +143,6 @@ async def voice_endpoint(file: UploadFile = File(...)):
         print(f"[!] Ошибка Gemini по голосу: {repr(e)}", flush=True)
         reply_text = "Не расслышала тебя, повтори пожалуйста."
 
-    # Ротация файлов (reply_1.mp3 ... reply_10.mp3)
     file_counter = (file_counter % 10) + 1
     audio_filename = f"reply_{file_counter}.mp3"
 
@@ -152,12 +160,10 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
 @app.websocket("/ws")
 async def websocket_handler(websocket: WebSocket):
-    """Подключение по WebSocket (для текстовых тестов и эмуляторов)."""
+    """Подключение по WebSocket."""
     global file_counter
     await websocket.accept()
     print("[+] Клиент подключен по WebSocket!", flush=True)
-
-    chat = get_chat()
 
     await websocket.send_text(json.dumps({
         "event": "connected",
@@ -185,6 +191,7 @@ async def websocket_handler(websocket: WebSocket):
             }))
 
             t_start = time.perf_counter()
+            chat = get_chat()
 
             try:
                 if chat:
@@ -192,7 +199,8 @@ async def websocket_handler(websocket: WebSocket):
                         chat.send_message(user_query),
                         timeout=10.0
                     )
-                    reply_text = response.text.strip()
+                    raw_text = getattr(response, "text", "")
+                    reply_text = raw_text.strip() if raw_text else "Ответ получен."
                 else:
                     reply_text = "В настройках сервера не указан API-ключ."
             except Exception as e:
@@ -205,8 +213,6 @@ async def websocket_handler(websocket: WebSocket):
             cleanup_old_audio()
             audio_ready = await synthesize_voice(reply_text, audio_filename)
             total_time = time.perf_counter() - t_start
-
-            print(f"[+] Итог: '{reply_text}' ({audio_filename}, время: {total_time:.2f}с)", flush=True)
 
             await websocket.send_text(json.dumps({
                 "event": "answer",
