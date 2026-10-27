@@ -20,9 +20,9 @@ print(f"[*] Старт сервера. Gemini: {bool(GEMINI_API_KEY)}", flush=Tr
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# Модель 'tiny' работает в 3 раза быстрее 'base' на CPU хостинга
-print("[*] Загрузка ультрабыстрого Faster-Whisper (tiny, int8)...", flush=True)
-whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+# Модель 'base' на int8 — идеальный баланс между скоростью (0.3с) и точностью русского языка
+print("[*] Загрузка качественного Faster-Whisper (модель base, int8)...", flush=True)
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 print("[+] Движок распознавания готов!", flush=True)
 
 try:
@@ -34,16 +34,17 @@ except Exception as e:
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
-# Умный, живой характер без занудства
 SYSTEM_INSTRUCTION = (
-    "Твое имя — Сима. Ты — остроумный, эрудированный и живой голосовой помощник в смарт-колонке. "
+    "Твое имя — Сима. Ты — остроумный, эрудированный голосовой помощник в смарт-колонке. "
     "Ты не Маруся и не Алиса, ты создана независимым инженером. "
-    "Отвечай интересно, емко, умным разговорным языком (2-3 хороших предложения). "
-    "Не строй из себя робота — проявляй характер, где уместно шути или подмечай детали. "
-    "Запрещено использовать списки, markdown, звездочки и таблицы, так как ответ пойдет в голос."
+    "ЯЗЫК: Отвечай ВСЕГДА И ТОЛЬКО НА РУССКОМ ЯЗЫКЕ! "
+    "ВАЖНО: Если в вопросе пользователя есть невнятные слова или ошибки распознавания речи "
+    "(например, 'звезд на ней бэфф' вместо 'на небе') — догадайся по смыслу и контексту, о чем речь, "
+    "и ответь на реальный вопрос. Никогда не комментируй ошибки распознавания и не говори по-английски! "
+    "Отвечай емко, интересно, живым языком (2-3 предложения). "
+    "Запрещено использовать списки, markdown, кавычки и звездочки."
 )
 
-# Первой идет самая умная модель
 CASCADE_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.5-flash",
@@ -64,19 +65,20 @@ def cleanup_old_audio():
 
 
 def local_stt(audio_bytes: bytes) -> str:
-    """Быстрое распознавание с фильтром тишины."""
+    """Качественное распознавание русской речи с контекстной подсказкой."""
     try:
         t0 = time.perf_counter()
+        # initial_prompt принуждает модель использовать нормальный русский словарь
         segments, _ = whisper_model.transcribe(
             io.BytesIO(audio_bytes),
             language="ru",
-            beam_size=1,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=300)
+            beam_size=2,  # Поиск по лучу устраняет глупые ошибки на окончаниях слов
+            initial_prompt="Разговорная русская речь, вопросы умной колонке Сима о мире, погоде и науке.",
+            vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
         dt = time.perf_counter() - t0
-        print(f"[+] STT ({dt:.2f}с): '{text}'", flush=True)
+        print(f"[+] STT Base ({dt:.2f}с): '{text}'", flush=True)
         return text
     except Exception as e:
         print(f"[!] Ошибка STT: {e}", flush=True)
@@ -84,7 +86,7 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_text(user_query: str) -> str:
-    """Генерация умного ответа."""
+    """Генерация умного ответа на чистом русском языке."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -98,17 +100,19 @@ async def query_gemini_text(user_query: str) -> str:
                     model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        max_output_tokens=150,  # Даем модели развернуться мыслью
-                        temperature=0.8,        # Больше креатива и живости
+                        max_output_tokens=150,
+                        temperature=0.7,
                     )
                 ),
                 timeout=7.0
             )
             raw_text = getattr(response, "text", "")
             if raw_text and raw_text.strip():
+                # Вычищаем кавычки и слэши, чтобы не ломать JSON в Bash
+                clean_text = raw_text.replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
-                print(f"[+] {model_name} ({dt:.2f}с): '{raw_text.strip()}'", flush=True)
-                return raw_text.strip()
+                print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
+                return clean_text
         except Exception as e:
             print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
             continue
@@ -123,7 +127,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 
     for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
         try:
-            communicate = edge_tts.Communicate(text, voice=voice, rate="+15%")  # +15% скорости речи (звучит бодрее!)
+            communicate = edge_tts.Communicate(text, voice=voice, rate="+15%")
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=5.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
@@ -135,7 +139,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "model": CASCADE_MODELS[0]}
+    return {"status": "ok", "stt": "faster-whisper-base"}
 
 
 @app.post("/voice")
@@ -151,9 +155,9 @@ async def voice_endpoint(file: UploadFile = File(...)):
         loop = asyncio.get_running_loop()
         recognized_text = await loop.run_in_executor(None, local_stt, audio_bytes)
 
-        if not recognized_text:
+        if not recognized_text or recognized_text in [".", "...", "!", "?"]:
             dt = round(time.perf_counter() - t_start, 2)
-            print(f"[+] Тишина ({dt}с).", flush=True)
+            print(f"[+] Чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
         reply_text = await query_gemini_text(recognized_text)
@@ -169,10 +173,14 @@ async def voice_endpoint(file: UploadFile = File(...)):
     audio_ready = await synthesize_voice(reply_text, audio_filename)
     total_time = time.perf_counter() - t_start
 
+    # Защита текста от ломающих кавычек
+    safe_user_said = recognized_text.replace('"', '').replace("'", "").replace('\\', '')
+    safe_reply = reply_text.replace('"', '').replace("'", "").replace('\\', '')
+
     return {
         "silent": False,
-        "text": reply_text,
-        "user_said": recognized_text,
+        "text": safe_reply,
+        "user_said": safe_user_said,
         "audio_ready": audio_ready,
         "audio_url": f"/audio/{audio_filename}" if audio_ready else None,
         "latency_sec": round(total_time, 2),
