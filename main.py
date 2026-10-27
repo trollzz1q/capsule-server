@@ -18,11 +18,10 @@ print(f"[*] Старт сервера. Ключ API найден: {bool(GEMINI_A
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# Инициализируем клиент без риска уронить весь сервис
 try:
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as e:
-    print(f"[!] Предупреждение: ошибка инициализации Google GenAI: {e}", flush=True)
+    print(f"[!] Предупреждение GenAI: {e}", flush=True)
     client = None
 
 app = FastAPI(title="Capsule Assistant Backend")
@@ -35,29 +34,15 @@ SYSTEM_INSTRUCTION = (
     "так как текст напрямую идёт в голосовой синтезатор."
 )
 
-MODEL_NAME = "gemini-3.8-flash"
+# Каскад: от сверхбыстрой Lite до мощной 3.8 Flash
+CASCADE_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.8-flash"
+]
 
-global_chat = None
 file_counter = 0
-
-
-def get_chat():
-    """Возвращает или создает активный чат с Симой."""
-    global global_chat
-    if client and global_chat is None:
-        try:
-            global_chat = client.aio.chats.create(
-                model=MODEL_NAME,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    max_output_tokens=75,
-                    temperature=0.7,
-                ),
-            )
-        except Exception as e:
-            print(f"[!] Ошибка создания чата: {e}", flush=True)
-            return None
-    return global_chat
 
 
 def cleanup_old_audio():
@@ -71,8 +56,45 @@ def cleanup_old_audio():
             pass
 
 
+async def query_gemini_multimodal(contents_payload: list) -> str:
+    """Перебирает каскад моделей, давая каждой ровно по 10 секунд."""
+    if not client or not GEMINI_API_KEY:
+        return "В настройках сервера не указан API ключ."
+
+    full_contents = [SYSTEM_INSTRUCTION] + contents_payload
+
+    for model_name in CASCADE_MODELS:
+        t0 = time.perf_counter()
+        try:
+            print(f"[*] Запрос к модели: {model_name}...", flush=True)
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model_name,
+                    contents=full_contents,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=75,
+                        temperature=0.7,
+                    )
+                ),
+                timeout=10.0
+            )
+            raw_text = getattr(response, "text", "")
+            if raw_text and raw_text.strip():
+                dt = time.perf_counter() - t0
+                print(f"[+] Модель {model_name} успешно ответила за {dt:.2f} сек: '{raw_text.strip()}'", flush=True)
+                return raw_text.strip()
+        except asyncio.TimeoutError:
+            print(f"[!] Модель {model_name} превысила таймаут 10с. Переключаем...", flush=True)
+            continue
+        except Exception as e:
+            print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
+            continue
+
+    return "Сервер перегружен, спроси чуть позже."
+
+
 async def synthesize_voice(text: str, filename: str) -> bool:
-    """Синтезирует речь в MP3 через Microsoft Edge TTS."""
+    """Синтез речи через Edge TTS."""
     filepath = AUDIO_DIR / filename
     if filepath.exists():
         filepath.unlink(missing_ok=True)
@@ -91,22 +113,12 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    """Эндпоинт проверки здоровья контейнера для хостинга."""
-    return {"status": "ok", "service": "capsule-server", "model": MODEL_NAME}
-
-
-@app.post("/reset")
-async def reset_context():
-    """Сбрасывает историю диалога."""
-    global global_chat
-    global_chat = None
-    print("[*] Память диалога сброшена.", flush=True)
-    return {"status": "cleared", "message": "Память Симы очищена"}
+    return {"status": "ok", "service": "capsule-server", "cascade": CASCADE_MODELS}
 
 
 @app.post("/voice")
 async def voice_endpoint(file: UploadFile = File(...)):
-    """Принимает голос с микрофона Капсулы, отправляет в Gemini и возвращает MP3."""
+    """Принимает голос с микрофона Капсулы, прогоняет через каскад и отдает MP3."""
     global file_counter
     t_start = time.perf_counter()
 
@@ -115,32 +127,13 @@ async def voice_endpoint(file: UploadFile = File(...)):
         if not audio_bytes:
             return {"text": "Пустой звук", "audio_url": None, "audio_ready": False}
 
-        chat = get_chat()
-        if not chat:
-            reply_text = "В настройках сервера не указан API-ключ."
-        else:
-            audio_part = types.Part.from_bytes(
-                data=audio_bytes,
-                mime_type="audio/wav"
-            )
-            prompt = (
-                "Пользователь задал вопрос голосом в аудиозаписи. "
-                "Прослушай его и ответь кратко (1-2 предложения), живо, без спецсимволов."
-            )
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+        user_prompt = "Пользователь задал вопрос голосом в аудиозаписи. Прослушай его и ответь кратко (1-2 предложения), живо, без спецсимволов."
 
-            response = await asyncio.wait_for(
-                chat.send_message([audio_part, prompt]),
-                timeout=10.0
-            )
-            raw_text = getattr(response, "text", "")
-            reply_text = raw_text.strip() if raw_text else "Я тебя услышала."
-            print(f"[+] Сима ответила: '{reply_text}'", flush=True)
+        reply_text = await query_gemini_multimodal([audio_part, user_prompt])
 
-    except asyncio.TimeoutError:
-        print("[!] Таймаут ответа Gemini по голосу", flush=True)
-        reply_text = "Сервер перегружен, спроси чуть позже."
     except Exception as e:
-        print(f"[!] Ошибка Gemini по голосу: {repr(e)}", flush=True)
+        print(f"[!] Ошибка обработки аудио: {repr(e)}", flush=True)
         reply_text = "Не расслышала тебя, повтори пожалуйста."
 
     file_counter = (file_counter % 10) + 1
@@ -160,7 +153,6 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
 @app.websocket("/ws")
 async def websocket_handler(websocket: WebSocket):
-    """Подключение по WebSocket."""
     global file_counter
     await websocket.accept()
     print("[+] Клиент подключен по WebSocket!", flush=True)
@@ -191,21 +183,7 @@ async def websocket_handler(websocket: WebSocket):
             }))
 
             t_start = time.perf_counter()
-            chat = get_chat()
-
-            try:
-                if chat:
-                    response = await asyncio.wait_for(
-                        chat.send_message(user_query),
-                        timeout=10.0
-                    )
-                    raw_text = getattr(response, "text", "")
-                    reply_text = raw_text.strip() if raw_text else "Ответ получен."
-                else:
-                    reply_text = "В настройках сервера не указан API-ключ."
-            except Exception as e:
-                print(f"[!] Ошибка Gemini: {repr(e)}", flush=True)
-                reply_text = "Сервер перегружен, спроси чуть позже."
+            reply_text = await query_gemini_multimodal([f"Вопрос пользователя: {user_query}"])
 
             file_counter = (file_counter % 10) + 1
             audio_filename = f"reply_{file_counter}.mp3"
