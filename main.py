@@ -17,19 +17,19 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера Capsule Assistant. Gemini API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (Надежная память диалога + Погода). API: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-print("[*] Инициализация Faster-Whisper (base, int8)...", flush=True)
+print("[*] Загрузка Faster-Whisper...", flush=True)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-print("[+] Движок распознавания готов к работе!", flush=True)
+print("[+] STT готов!", flush=True)
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as e:
-    print(f"[!] Ошибка GenAI Client: {e}", flush=True)
+    print(f"[!] Ошибка GenAI: {e}", flush=True)
     client = None
 
 app = FastAPI(title="Capsule Assistant Backend")
@@ -52,7 +52,9 @@ CASCADE_MODELS = [
 ]
 
 file_counter = 0
-chat_history: list[types.Content] = []
+
+# --- СТАБИЛЬНАЯ ПАМЯТЬ НА СЛОВАРЯХ PYTHON ---
+chat_history: list[dict] = []
 last_interaction_time: float = 0.0
 
 
@@ -67,34 +69,35 @@ def cleanup_old_audio():
 
 
 def fetch_weather_report(city: str = "Novorossiysk") -> str:
-    """Бесплатное получение актуальной погоды без ключей за 0.2 сек."""
+    """Бесплатное получение живой погоды без API ключей."""
     try:
         encoded = urllib.parse.quote(city.strip())
         url = f"https://wttr.in/{encoded}?format=%l:+%C,+температура+%t,+ветер+%w&lang=ru"
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = resp.read().decode("utf-8").strip()
-            print(f"[+] Сводка погоды ({city}): '{data}'", flush=True)
+            print(f"[+] Погода ({city}): '{data}'", flush=True)
             return data
     except Exception as e:
-        print(f"[!] Ошибка метеослужбы: {e}", flush=True)
+        print(f"[!] Ошибка wttr.in: {e}", flush=True)
         return ""
 
 
-def get_history_with_query(user_query: str) -> list[types.Content]:
+def get_history_with_query(user_query: str) -> list[dict]:
+    """Формирует историю в нативном формате словарей Gemini."""
     global chat_history, last_interaction_time
     now = time.time()
 
     if now - last_interaction_time > 60.0:
         chat_history = []
-        print("[*] Контекст сброшен по таймауту неактивности (60с).", flush=True)
+        print("[*] Память диалога сброшена по таймауту (60с).", flush=True)
 
     last_interaction_time = now
 
     q_lower = user_query.lower()
     prompt_with_data = user_query
 
-    # Если вопрос про погоду — забираем живой прогноз
+    # Если спросили про погоду — добавляем живые цифры
     if any(w in q_lower for w in ["погод", "градус", "дожд", "температур", "ветер", "тепло", "холод"]):
         target_city = "Novorossiysk"
         if "москв" in q_lower: target_city = "Moscow"
@@ -106,9 +109,12 @@ def get_history_with_query(user_query: str) -> list[types.Content]:
         if weather_info:
             prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {weather_info}]"
 
-    chat_history.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=prompt_with_data)])
-    )
+    # Добавляем реплику пользователя через чистый словарь
+    chat_history.append({
+        "role": "user",
+        "parts": [{"text": prompt_with_data}]
+    })
+
     if len(chat_history) > 8:
         chat_history = chat_history[-8:]
 
@@ -116,10 +122,12 @@ def get_history_with_query(user_query: str) -> list[types.Content]:
 
 
 def append_assistant_reply(reply_text: str):
+    """Сохраняет ответ ассистента в историю."""
     global chat_history
-    chat_history.append(
-        types.Content(role="model", parts=[types.Part.from_text(text=reply_text)])
-    )
+    chat_history.append({
+        "role": "model",
+        "parts": [{"text": reply_text}]
+    })
 
 
 def local_stt(audio_bytes: bytes) -> str:
@@ -145,7 +153,7 @@ async def query_gemini_with_context(user_query: str) -> str:
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
-    full_context_contents = get_history_with_query(user_query)
+    full_context = get_history_with_query(user_query)
 
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
@@ -153,7 +161,7 @@ async def query_gemini_with_context(user_query: str) -> str:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
-                    contents=full_context_contents,
+                    contents=full_context,  # ЧИСТЫЙ СПИСОК СЛОВАРЕЙ (БЕЗ БАГОВ)
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         max_output_tokens=350,
@@ -172,7 +180,7 @@ async def query_gemini_with_context(user_query: str) -> str:
                 return clean_text
 
         except Exception as e:
-            print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
+            print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
             continue
 
     return "Сервер задумался, спроси еще разок."
@@ -198,14 +206,14 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "weather": "active", "stt": "faster-whisper-base"}
+    return {"status": "ok", "service": "capsule-server", "context_turns": len(chat_history)}
 
 
 @app.post("/reset")
 async def reset_context():
     global chat_history
     chat_history = []
-    return {"status": "ok", "message": "Контекст диалога очищен"}
+    return {"status": "ok", "message": "Память диалога сброшена"}
 
 
 @app.post("/voice")
@@ -223,7 +231,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
         if not recognized_text or recognized_text in [".", "...", "!", "?"]:
             dt = round(time.perf_counter() - t_start, 2)
-            print(f"[+] Зафиксирована чистая тишина ({dt}с).", flush=True)
+            print(f"[+] Чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
         reply_text = await query_gemini_with_context(recognized_text)
