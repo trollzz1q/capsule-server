@@ -39,31 +39,32 @@ FAST_MODELS = [
 
 
 async def ask_gemini(user_text: str) -> str:
-    """Асинхронный запрос через нативный client.aio с таймаутом."""
     full_prompt = f"{SYSTEM_PROMPT}\nВопрос пользователя: {user_text}"
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
-    for model_name in FAST_MODELS:
+    for model_name in models_to_try:
         t0 = time.perf_counter()
         try:
-            interaction = await asyncio.wait_for(
-                client.aio.interactions.create(
+            # Корректный асинхронный вызов генерации в google-genai
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
                     model=model_name,
-                    input=full_prompt,
+                    contents=full_prompt,
                 ),
-                timeout=10.0
+                timeout=7.0
             )
             dt = time.perf_counter() - t0
-            if interaction and interaction.output_text:
+            if response and response.text:
                 print(f"[+] {model_name} ответила за {dt:.2f} сек")
-                return interaction.output_text.strip()
+                return response.text.strip()
         except asyncio.TimeoutError:
-            print(f"[!] Таймаут модели {model_name} (>10 сек), переход к следующей...")
+            print(f"[!] Таймаут модели {model_name}")
             continue
         except Exception as e:
-            print(f"[!] Сбой {model_name}: {e}")
+            print(f"[!] Ошибка вызова {model_name}: {e}")
             continue
 
-    return "Сервер искусственного интеллекта перегружен, попробуй задать вопрос позже."
+    return "Сервер перегружен, спроси чуть позже."
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:

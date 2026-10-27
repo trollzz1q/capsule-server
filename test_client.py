@@ -2,7 +2,7 @@ import asyncio
 import json
 import websockets
 
-SERVER_URI = "ws://127.0.0.1:8080/ws"
+SERVER_URI = "ws://31.77.128.129:40000/ws"
 
 async def test():
     print(f"[*] Подключаемся к {SERVER_URI}...")
