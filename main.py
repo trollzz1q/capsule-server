@@ -15,15 +15,15 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера. Gemini API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера. Gemini: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# 1. Загружаем локальный Whisper в память (модель base с int8 для максимальной скорости на CPU)
-print("[*] Загрузка локального движка Faster-Whisper (модель base, int8)...", flush=True)
-whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-print("[+] Faster-Whisper готов к работе! Никаких лимитов и ключей.", flush=True)
+# Модель 'tiny' работает в 3 раза быстрее 'base' на CPU хостинга
+print("[*] Загрузка ультрабыстрого Faster-Whisper (tiny, int8)...", flush=True)
+whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+print("[+] Движок распознавания готов!", flush=True)
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -34,19 +34,20 @@ except Exception as e:
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+# Умный, живой характер без занудства
 SYSTEM_INSTRUCTION = (
-    "Тебя зовут Сима. Ты — кастомный, независимый и умный голосовой ассистент нового поколения. "
-    "Ты живешь внутри аппаратной смарт-колонки. Ты КАТЕГОРИЧЕСКИ НЕ МАРУСЯ и не имеешь к VK отношения! "
-    "Твой создатель — разработчик, который перепрошил эту колонку и дал тебе жизнь. "
-    "Отвечай кратко, емко, живым разговорным языком (1-2 коротких предложения). "
-    "Категорически запрещено использовать списки, markdown, звёздочки, таблицы и эмодзи."
+    "Твое имя — Сима. Ты — остроумный, эрудированный и живой голосовой помощник в смарт-колонке. "
+    "Ты не Маруся и не Алиса, ты создана независимым инженером. "
+    "Отвечай интересно, емко, умным разговорным языком (2-3 хороших предложения). "
+    "Не строй из себя робота — проявляй характер, где уместно шути или подмечай детали. "
+    "Запрещено использовать списки, markdown, звездочки и таблицы, так как ответ пойдет в голос."
 )
 
+# Первой идет самая умная модель
 CASCADE_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
     "gemini-3.5-flash",
-    "gemini-3.8-flash"
+    "gemini-2.5-flash"
 ]
 
 file_counter = 0
@@ -63,31 +64,27 @@ def cleanup_old_audio():
 
 
 def local_stt(audio_bytes: bytes) -> str:
-    """
-    Локальное распознавание речи со встроенным Silero VAD фильтром тишины.
-    Работает прямо в оперативной памяти сервера без временных файлов.
-    """
+    """Быстрое распознавание с фильтром тишины."""
     try:
         t0 = time.perf_counter()
-        # vad_filter=True мгновенно отсекает тишину и шумы вентиляторов
-        segments, info = whisper_model.transcribe(
+        segments, _ = whisper_model.transcribe(
             io.BytesIO(audio_bytes),
             language="ru",
-            beam_size=1,        # Максимальная скорость
-            vad_filter=True,    # Встроенный детектор активности голоса
-            vad_parameters=dict(min_silence_duration_ms=400)
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=300)
         )
         text = " ".join([seg.text for seg in segments]).strip()
         dt = time.perf_counter() - t0
-        print(f"[+] Faster-Whisper ({dt:.2f}с): '{text}'", flush=True)
+        print(f"[+] STT ({dt:.2f}с): '{text}'", flush=True)
         return text
     except Exception as e:
-        print(f"[!] Ошибка Faster-Whisper: {e}", flush=True)
+        print(f"[!] Ошибка STT: {e}", flush=True)
         return ""
 
 
 async def query_gemini_text(user_query: str) -> str:
-    """Генерация ответа по чистому тексту."""
+    """Генерация умного ответа."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -101,22 +98,22 @@ async def query_gemini_text(user_query: str) -> str:
                     model=model_name,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        max_output_tokens=75,
-                        temperature=0.7,
+                        max_output_tokens=150,  # Даем модели развернуться мыслью
+                        temperature=0.8,        # Больше креатива и живости
                     )
                 ),
-                timeout=8.0
+                timeout=7.0
             )
             raw_text = getattr(response, "text", "")
             if raw_text and raw_text.strip():
                 dt = time.perf_counter() - t0
-                print(f"[+] Gemini ({model_name}, {dt:.2f}с): '{raw_text.strip()}'", flush=True)
+                print(f"[+] {model_name} ({dt:.2f}с): '{raw_text.strip()}'", flush=True)
                 return raw_text.strip()
         except Exception as e:
             print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
             continue
 
-    return "Сервер перегружен, спроси чуть позже."
+    return "Сервер задумался, спроси еще разок."
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
@@ -126,8 +123,8 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 
     for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
         try:
-            communicate = edge_tts.Communicate(text, voice=voice, rate="+10%")
-            await asyncio.wait_for(communicate.save(str(filepath)), timeout=6.0)
+            communicate = edge_tts.Communicate(text, voice=voice, rate="+15%")  # +15% скорости речи (звучит бодрее!)
+            await asyncio.wait_for(communicate.save(str(filepath)), timeout=5.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
         except Exception:
@@ -138,7 +135,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "stt": "faster-whisper-local"}
+    return {"status": "ok", "model": CASCADE_MODELS[0]}
 
 
 @app.post("/voice")
@@ -151,28 +148,19 @@ async def voice_endpoint(file: UploadFile = File(...)):
         if not audio_bytes or len(audio_bytes) < 1000:
             return {"silent": True, "text": "", "audio_ready": False}
 
-        # 1. Локальное распознавание (выполняется в отдельном потоке, чтобы не блокировать event-loop)
         loop = asyncio.get_running_loop()
         recognized_text = await loop.run_in_executor(None, local_stt, audio_bytes)
 
-        # 2. Если тишина (Silero VAD ничего не нашел) — мгновенный отбой!
         if not recognized_text:
             dt = round(time.perf_counter() - t_start, 2)
-            print(f"[+] Зафиксирована тишина ({dt}с). Сима молчит.", flush=True)
-            return {
-                "silent": True,
-                "text": "",
-                "audio_ready": False,
-                "audio_url": None,
-                "latency_sec": dt
-            }
+            print(f"[+] Тишина ({dt}с).", flush=True)
+            return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
-        # 3. Если есть распознанный текст — опрос Gemini
         reply_text = await query_gemini_text(recognized_text)
 
     except Exception as e:
-        print(f"[!] Ошибка voice_endpoint: {repr(e)}", flush=True)
-        reply_text = "Не расслышала тебя, повтори пожалуйста."
+        print(f"[!] Ошибка: {e}", flush=True)
+        reply_text = "Что-то пошло не так, повтори пожалуйста."
 
     file_counter = (file_counter % 10) + 1
     audio_filename = f"reply_{file_counter}.mp3"
@@ -193,7 +181,6 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
 @app.websocket("/ws")
 async def websocket_handler(websocket: WebSocket):
-    global file_counter
     await websocket.accept()
     await websocket.send_text(json.dumps({"event": "connected", "message": "Сима на связи"}))
 
@@ -201,30 +188,22 @@ async def websocket_handler(websocket: WebSocket):
         while True:
             raw_data = await websocket.receive_text()
             try:
-                payload = json.loads(raw_data)
-                user_query = payload.get("text", "").strip()
-            except json.JSONDecodeError:
+                user_query = json.loads(raw_data).get("text", "").strip()
+            except Exception:
                 user_query = raw_data.strip()
 
             if not user_query:
                 continue
 
-            t_start = time.perf_counter()
             reply_text = await query_gemini_text(user_query)
-
-            file_counter = (file_counter % 10) + 1
-            audio_filename = f"reply_{file_counter}.mp3"
-
-            cleanup_old_audio()
+            audio_filename = f"reply_ws.mp3"
             audio_ready = await synthesize_voice(reply_text, audio_filename)
-            total_time = time.perf_counter() - t_start
 
             await websocket.send_text(json.dumps({
                 "event": "answer",
                 "text": reply_text,
                 "audio_ready": audio_ready,
-                "audio_url": f"/audio/{audio_filename}" if audio_ready else None,
-                "latency_sec": round(total_time, 2)
+                "audio_url": f"/audio/{audio_filename}" if audio_ready else None
             }))
     except WebSocketDisconnect:
         pass
