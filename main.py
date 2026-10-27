@@ -15,7 +15,7 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Легкий быстрый стек). Gemini: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (Контекстный диалог). Gemini: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -36,8 +36,9 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный, дружелюбный и эрудированный голосовой ассистент смарт-колонки. "
     "Отвечай строго на русском языке! "
-    "Давай полные, интересные, умные и развернутые ответы (2-4 предложения). "
-    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух."
+    "Давай полные, интересные, умные и живые ответы (2-4 предложения). "
+    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух. "
+    "Помни контекст текущего диалога с пользователем."
 )
 
 CASCADE_MODELS = [
@@ -48,6 +49,10 @@ CASCADE_MODELS = [
 ]
 
 file_counter = 0
+
+# --- СИСТЕМА ПАМЯТИ ДИАЛОГА ---
+chat_history: list[types.Content] = []
+last_interaction_time: float = 0.0
 
 
 def cleanup_old_audio():
@@ -60,6 +65,36 @@ def cleanup_old_audio():
             pass
 
 
+def get_history_with_query(user_query: str) -> list[types.Content]:
+    """Удерживает контекст диалога. Сбрасывает при паузе > 60 секунд."""
+    global chat_history, last_interaction_time
+    now = time.time()
+
+    # Если прошло больше минуты — начинаем диалог с чистого листа
+    if now - last_interaction_time > 60.0:
+        chat_history = []
+        print("[*] Контекст сброшен по таймауту неактивности (60с).", flush=True)
+
+    last_interaction_time = now
+
+    chat_history.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_query)])
+    )
+    # Держим в памяти до 8 последних реплик
+    if len(chat_history) > 8:
+        chat_history = chat_history[-8:]
+
+    return list(chat_history)
+
+
+def append_assistant_reply(reply_text: str):
+    """Сохраняет ответ Симы в память."""
+    global chat_history
+    chat_history.append(
+        types.Content(role="model", parts=[types.Part.from_text(text=reply_text)])
+    )
+
+
 def local_stt(audio_bytes: bytes) -> str:
     try:
         t0 = time.perf_counter()
@@ -67,7 +102,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, умная колонка Сима.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, города, погода, музыка.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -79,9 +114,12 @@ def local_stt(audio_bytes: bytes) -> str:
         return ""
 
 
-async def query_gemini_text(user_query: str) -> str:
+async def query_gemini_with_context(user_query: str) -> str:
+    """Генерация с учетом контекста беседы."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
+
+    full_context_contents = get_history_with_query(user_query)
 
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
@@ -89,7 +127,7 @@ async def query_gemini_text(user_query: str) -> str:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
-                    contents=user_query,
+                    contents=full_context_contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         max_output_tokens=300,
@@ -104,6 +142,7 @@ async def query_gemini_text(user_query: str) -> str:
                 clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
                 print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
+                append_assistant_reply(clean_text)
                 return clean_text
 
         except Exception as e:
@@ -120,7 +159,6 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 
     for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
         try:
-            # Увеличенный таймаут до 15 секунд — озвучит текст любой длины!
             communicate = edge_tts.Communicate(text, voice=voice, rate="+20%")
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
             if filepath.exists() and filepath.stat().st_size > 0:
@@ -134,7 +172,14 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server"}
+    return {"status": "ok", "service": "capsule-server", "context_turns": len(chat_history)}
+
+
+@app.post("/reset")
+async def reset_context():
+    global chat_history
+    chat_history = []
+    return {"status": "ok", "message": "Контекст диалога очищен"}
 
 
 @app.post("/voice")
@@ -155,7 +200,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             print(f"[+] Чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
-        reply_text = await query_gemini_text(recognized_text)
+        reply_text = await query_gemini_with_context(recognized_text)
 
         file_counter = (file_counter % 10) + 1
         audio_filename = f"reply_{file_counter}.mp3"
