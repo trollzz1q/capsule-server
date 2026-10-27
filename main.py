@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import struct
 import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
@@ -49,7 +50,7 @@ file_counter = 0
 
 
 def cleanup_old_audio():
-    """Удаляет аудиофайлы старше 5 минут."""
+    """Удаляет сгенерированные файлы старше 5 минут."""
     now = time.time()
     for f in AUDIO_DIR.glob("reply_*.mp3"):
         try:
@@ -59,8 +60,43 @@ def cleanup_old_audio():
             pass
 
 
+def analyze_audio_energy(audio_bytes: bytes, threshold: float = 950.0) -> tuple[bool, float]:
+    """
+    Анализирует WAV-сэмплы в Python.
+    Полностью вычитает постоянную составляющую (DC-смещение PDM-чипа).
+    Возвращает (is_silent, чистая_энергия_звука).
+    """
+    try:
+        if len(audio_bytes) < 44 or audio_bytes[:4] != b"RIFF":
+            return False, 9999.0
+
+        # Находим реальное начало сэмплов данных в WAV
+        data_pos = audio_bytes.find(b"data")
+        raw_pcm = audio_bytes[data_pos + 8:] if (data_pos != -1 and len(audio_bytes) > data_pos + 8) else audio_bytes[44:]
+
+        num_samples = len(raw_pcm) // 2
+        if num_samples < 800:
+            return True, 0.0
+
+        # Распаковываем 16-битные знаковые сэмплы
+        samples = struct.unpack(f"<{num_samples}h", raw_pcm[:num_samples * 2])
+
+        # Вычисляем постоянный уровень покоя (DC offset)
+        dc_mean = sum(samples) / num_samples
+
+        # Считаем размах переменной составляющей вокруг уровня покоя
+        ac_energy = sum(abs(s - dc_mean) for s in samples) / num_samples
+
+        # Если амплитуда ниже порога — в комнате тишина/кулеры
+        is_silent = ac_energy < threshold
+        return is_silent, ac_energy
+    except Exception as e:
+        print(f"[!] Ошибка анализа аудио: {e}", flush=True)
+        return False, 9999.0
+
+
 async def query_gemini_multimodal(contents_payload: list) -> str:
-    """Перебирает каскад моделей с таймаутом 10с на каждую."""
+    """Опрос каскада моделей с таймаутом 10с на каждую."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -84,7 +120,7 @@ async def query_gemini_multimodal(contents_payload: list) -> str:
             raw_text = getattr(response, "text", "")
             if raw_text and raw_text.strip():
                 dt = time.perf_counter() - t0
-                print(f"[+] Модель {model_name} ответила за {dt:.2f} сек: '{raw_text.strip()}'", flush=True)
+                print(f"[+] Модель {model_name} ответила за {dt:.2f}с: '{raw_text.strip()}'", flush=True)
                 return raw_text.strip()
         except asyncio.TimeoutError:
             print(f"[!] Таймаут 10с на {model_name}. Переключаем...", flush=True)
@@ -97,14 +133,13 @@ async def query_gemini_multimodal(contents_payload: list) -> str:
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
-    """Синтез речи через Edge TTS с автоповтором при сбоях сети."""
+    """Синтез речи через Edge TTS с 3 попытками."""
     filepath = AUDIO_DIR / filename
     if filepath.exists():
         filepath.unlink(missing_ok=True)
 
     voices = ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]
 
-    # Даем до 3 попыток на случай кратковременного обрыва связи с Microsoft
     for attempt in range(1, 4):
         for voice in voices:
             try:
@@ -134,8 +169,23 @@ async def voice_endpoint(file: UploadFile = File(...)):
     try:
         audio_bytes = await file.read()
         if not audio_bytes:
-            return {"text": "Пустой звук", "audio_url": None, "audio_ready": False}
+            return {"silent": True, "text": "Пустой звук", "audio_url": None, "audio_ready": False}
 
+        # --- ЖЕЛЕЗНЫЙ ФИЛЬТР ТИШИНЫ ---
+        is_silent, energy = analyze_audio_energy(audio_bytes, threshold=950.0)
+        print(f"[*] Анализ входящего звука: чистая энергия = {energy:.1f} (порог 950.0)", flush=True)
+
+        if is_silent:
+            print("[+] Сервер зафиксировал тишину. Gemini не вызывается.", flush=True)
+            return {
+                "silent": True,
+                "text": "",
+                "audio_ready": False,
+                "audio_url": None,
+                "latency_sec": round(time.perf_counter() - t_start, 2),
+            }
+
+        # Если обнаружен реальный голос — запускаем Gemini
         audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
         user_prompt = (
             "Пользователь обратился к тебе голосом через комнатный микрофон. "
@@ -156,6 +206,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
     total_time = time.perf_counter() - t_start
 
     return {
+        "silent": False,
         "text": reply_text,
         "audio_ready": audio_ready,
         "audio_url": f"/audio/{audio_filename}" if audio_ready else None,
@@ -187,7 +238,7 @@ async def websocket_handler(websocket: WebSocket):
             if not user_query:
                 continue
 
-            print(f"[*] Вопрос Симе: '{user_query}'", flush=True)
+            print(f"[*] Вопрос Симе (WS): '{user_query}'", flush=True)
 
             await websocket.send_text(json.dumps({
                 "event": "thinking",
