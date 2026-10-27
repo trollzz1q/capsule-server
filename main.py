@@ -33,13 +33,11 @@ except Exception as e:
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
-# Правильная, умная системная инструкция
+# ЧИСТЫЙ МИНИМАЛЬНЫЙ ПРОМПТ
 SYSTEM_INSTRUCTION = (
-    "Ты — Сима, умный, остроумный и душевный голосовой ассистент внутри смарт-колонки. "
-    "Твой создатель — независимый инженер-разработчик. "
-    "Отвечай на вопросы пользователя интересно, точно, грамотно и по существу на чистом русском языке. "
-    "Разговаривай живым разговорным тоном (2-3 хороших предложения). "
-    "Категорически запрещено использовать markdown, списки, звездочки, кавычки и смайлики."
+    "Отвечай всегда строго на русском языке. "
+    "Давай полные, интересные, грамотные и развернутые ответы для смарт-колонки. "
+    "Запрещено использовать markdown, списки, звездочки, кавычки и таблицы, так как текст идет в синтезатор речи."
 )
 
 CASCADE_MODELS = [
@@ -69,7 +67,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, вопросы умной колонке Сима о мире, науке и жизни.",
+            initial_prompt="Разговорная русская речь, вопросы голосовому ассистенту Сима.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -82,35 +80,50 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_text(user_query: str) -> str:
-    """Генерация через официальный system_instruction в Config."""
+    """Генерация с автоматическим мышлением и фильтрацией английских мыслей."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
         try:
-            # ПРАВИЛЬНЫЙ ВЫЗОВ GOOGLE GENAI:
-            # Промпт идет в config.system_instruction, а в contents ТОЛЬКО вопрос!
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
                     contents=user_query,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
-                        max_output_tokens=200,
+                        max_output_tokens=1000,  # Сняли лимит — дает полные ответы!
                         temperature=0.7,
                     )
                 ),
-                timeout=8.0
+                timeout=12.0
             )
-            raw_text = getattr(response, "text", "")
-            if raw_text and raw_text.strip():
-                # Убираем кавычки, переносы строк и спецсимволы
+
+            # ОТДЕЛЯЕМ РУССКИЙ ОТВЕТ ОТ АНГЛИЙСКИХ МЫСЛЕЙ (THOUGHTS)
+            answer_parts = []
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    # Если блок помечен как мысль (thought) — пропускаем!
+                    if getattr(part, "thought", False):
+                        continue
+                    if part.text:
+                        answer_parts.append(part.text)
+
+            raw_text = "".join(answer_parts).strip()
+
+            # Если частей не нашлось — берем fallback text
+            if not raw_text:
+                raw_text = getattr(response, "text", "").strip()
+
+            if raw_text:
+                # Очищаем спецсимволы
                 clean_text = " ".join(raw_text.split())
                 clean_text = clean_text.replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
                 print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
                 return clean_text
+
         except Exception as e:
             print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
             continue
@@ -126,7 +139,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
     for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
         try:
             communicate = edge_tts.Communicate(text, voice=voice, rate="+15%")
-            await asyncio.wait_for(communicate.save(str(filepath)), timeout=5.0)
+            await asyncio.wait_for(communicate.save(str(filepath)), timeout=8.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
         except Exception:
