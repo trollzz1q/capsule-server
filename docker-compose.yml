@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  capsule-server:
+    build: .
+    container_name: capsule_backend
+    restart: always
+    ports:
+      - "40000:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./static_audio:/app/static_audio
+    environment:
+      - PORT=8080
