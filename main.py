@@ -32,7 +32,9 @@ SYSTEM_PROMPT = (
 )
 
 FAST_MODELS = [
-    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash"
 ]
 
 async def ask_gemini(user_text: str) -> str:
@@ -55,7 +57,7 @@ async def ask_gemini(user_text: str) -> str:
                     model=model_name,
                     contents=full_prompt,
                 ),
-                timeout=7.0
+                timeout=10.0  # увеличили до 10 сек
             )
             dt = time.perf_counter() - t0
             if response and response.text:
