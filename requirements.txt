@@ -7,5 +7,4 @@ aiofiles
 python-dotenv
 google-genai
 faster-whisper
-torch
-torchaudio
+edge-tts

@@ -10,34 +10,19 @@ from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
 from faster_whisper import WhisperModel
-import torch
+import edge_tts
 
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Gemini + Local Silero TTS). API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (Легкий быстрый стек). Gemini: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# 1. Загрузка STT (Whisper)
-print("[*] Загрузка Faster-Whisper (base, int8)...", flush=True)
+print("[*] Загрузка Faster-Whisper...", flush=True)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 print("[+] STT готов!", flush=True)
-
-# 2. Загрузка сверхбыстрого Silero TTS (V4 Russian, 0.08с)
-print("[*] Загрузка локального Silero TTS (голос Kseniya)...", flush=True)
-device = torch.device('cpu')
-torch.set_num_threads(4)
-
-silero_model, _ = torch.hub.load(
-    repo_or_dir='snakers4/silero-models',
-    model='silero_tts',
-    language='ru',
-    speaker='v4_ru'
-)
-silero_model.to(device)
-print("[+] Silero TTS загружен и готов к мгновенному синтезу!", flush=True)
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -67,7 +52,7 @@ file_counter = 0
 
 def cleanup_old_audio():
     now = time.time()
-    for f in AUDIO_DIR.glob("reply_*.wav"):
+    for f in AUDIO_DIR.glob("reply_*.mp3"):
         try:
             if now - f.stat().st_mtime > 300:
                 f.unlink(missing_ok=True)
@@ -76,14 +61,13 @@ def cleanup_old_audio():
 
 
 def local_stt(audio_bytes: bytes) -> str:
-    """Распознавание речи."""
     try:
         t0 = time.perf_counter()
         segments, _ = whisper_model.transcribe(
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, погода, космос.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, умная колонка Сима.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -96,7 +80,6 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_text(user_query: str) -> str:
-    """Генерация ответа через каскад моделей."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
 
@@ -113,21 +96,10 @@ async def query_gemini_text(user_query: str) -> str:
                         temperature=0.7,
                     )
                 ),
-                timeout=10.0
+                timeout=12.0
             )
 
-            answer_parts = []
-            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if getattr(part, "thought", False):
-                        continue
-                    if part.text:
-                        answer_parts.append(part.text)
-
-            raw_text = "".join(answer_parts).strip()
-            if not raw_text:
-                raw_text = getattr(response, "text", "").strip()
-
+            raw_text = getattr(response, "text", "")
             if raw_text:
                 clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
@@ -141,47 +113,28 @@ async def query_gemini_text(user_query: str) -> str:
     return "Сервер задумался, спроси еще разок."
 
 
-def synthesize_silero(text: str, filename: str) -> bool:
-    """Мгновенный локальный синтез речи (0.08с) в чистый WAV (24 кГц)."""
-    try:
-        t0 = time.perf_counter()
-        filepath = AUDIO_DIR / filename
+async def synthesize_voice(text: str, filename: str) -> bool:
+    filepath = AUDIO_DIR / filename
+    if filepath.exists():
+        filepath.unlink(missing_ok=True)
 
-        # Генерация аудио тензора (голос kseniya, частота 24000 Гц)
-        audio = silero_model.apply_tts(
-            text=text,
-            speaker='kseniya',
-            sample_rate=24000
-        )
-
-        # Сохранение в WAV через torchaudio/io
-        import soundfile as sf
-        sf.write(str(filepath), audio.numpy(), 24000)
-
-        dt = time.perf_counter() - t0
-        print(f"[+] Silero TTS ({dt:.2f}с) сохранил {filename}", flush=True)
-        return True
-    except Exception as e:
-        # Fallback на wave если soundfile не установлен
+    for voice in ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"]:
         try:
-            import wave
-            filepath = AUDIO_DIR / filename
-            audio_int16 = (audio * 32767).clamp(-32768, 32767).to(torch.int16).numpy()
-            with wave.open(str(filepath), 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(24000)
-                wf.writeframes(audio_int16.tobytes())
-            return True
-        except Exception as err:
-            print(f"[!] Ошибка Silero TTS: {e} / {err}", flush=True)
-            return False
+            # Увеличенный таймаут до 15 секунд — озвучит текст любой длины!
+            communicate = edge_tts.Communicate(text, voice=voice, rate="+20%")
+            await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
+            if filepath.exists() and filepath.stat().st_size > 0:
+                return True
+        except Exception as e:
+            print(f"[!] Ошибка озвучки ({voice}): {e}", flush=True)
+            continue
+    return False
 
 
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "tts": "silero-local-kseniya"}
+    return {"status": "ok", "service": "capsule-server"}
 
 
 @app.post("/voice")
@@ -205,11 +158,10 @@ async def voice_endpoint(file: UploadFile = File(...)):
         reply_text = await query_gemini_text(recognized_text)
 
         file_counter = (file_counter % 10) + 1
-        audio_filename = f"reply_{file_counter}.wav"
+        audio_filename = f"reply_{file_counter}.mp3"
 
         cleanup_old_audio()
-        # Мгновенный синтез в отдельном потоке
-        audio_ready = await loop.run_in_executor(None, synthesize_silero, reply_text, audio_filename)
+        audio_ready = await synthesize_voice(reply_text, audio_filename)
         total_time = time.perf_counter() - t_start
 
         safe_user_said = " ".join(recognized_text.split()).replace('"', '').replace("'", "")
