@@ -20,8 +20,7 @@ print(f"[*] Старт сервера. Gemini: {bool(GEMINI_API_KEY)}", flush=Tr
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# Модель 'base' на int8 — идеальный баланс между скоростью (0.3с) и точностью русского языка
-print("[*] Загрузка качественного Faster-Whisper (модель base, int8)...", flush=True)
+print("[*] Загрузка Faster-Whisper (base, int8)...", flush=True)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 print("[+] Движок распознавания готов!", flush=True)
 
@@ -34,15 +33,13 @@ except Exception as e:
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+# Правильная, умная системная инструкция
 SYSTEM_INSTRUCTION = (
-    "Твое имя — Сима. Ты — остроумный, эрудированный голосовой помощник в смарт-колонке. "
-    "Ты не Маруся и не Алиса, ты создана независимым инженером. "
-    "ЯЗЫК: Отвечай ВСЕГДА И ТОЛЬКО НА РУССКОМ ЯЗЫКЕ! "
-    "ВАЖНО: Если в вопросе пользователя есть невнятные слова или ошибки распознавания речи "
-    "(например, 'звезд на ней бэфф' вместо 'на небе') — догадайся по смыслу и контексту, о чем речь, "
-    "и ответь на реальный вопрос. Никогда не комментируй ошибки распознавания и не говори по-английски! "
-    "Отвечай емко, интересно, живым языком (2-3 предложения). "
-    "Запрещено использовать списки, markdown, кавычки и звездочки."
+    "Ты — Сима, умный, остроумный и душевный голосовой ассистент внутри смарт-колонки. "
+    "Твой создатель — независимый инженер-разработчик. "
+    "Отвечай на вопросы пользователя интересно, точно, грамотно и по существу на чистом русском языке. "
+    "Разговаривай живым разговорным тоном (2-3 хороших предложения). "
+    "Категорически запрещено использовать markdown, списки, звездочки, кавычки и смайлики."
 )
 
 CASCADE_MODELS = [
@@ -65,20 +62,19 @@ def cleanup_old_audio():
 
 
 def local_stt(audio_bytes: bytes) -> str:
-    """Качественное распознавание русской речи с контекстной подсказкой."""
+    """Распознавание речи через Whisper Base."""
     try:
         t0 = time.perf_counter()
-        # initial_prompt принуждает модель использовать нормальный русский словарь
         segments, _ = whisper_model.transcribe(
             io.BytesIO(audio_bytes),
             language="ru",
-            beam_size=2,  # Поиск по лучу устраняет глупые ошибки на окончаниях слов
-            initial_prompt="Разговорная русская речь, вопросы умной колонке Сима о мире, погоде и науке.",
+            beam_size=2,
+            initial_prompt="Разговорная русская речь, вопросы умной колонке Сима о мире, науке и жизни.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
         dt = time.perf_counter() - t0
-        print(f"[+] STT Base ({dt:.2f}с): '{text}'", flush=True)
+        print(f"[+] STT ({dt:.2f}с): '{text}'", flush=True)
         return text
     except Exception as e:
         print(f"[!] Ошибка STT: {e}", flush=True)
@@ -86,30 +82,32 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_text(user_query: str) -> str:
-    """Генерация умного ответа на чистом русском языке."""
+    """Генерация через официальный system_instruction в Config."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ."
-
-    prompt = f"{SYSTEM_INSTRUCTION}\nВопрос пользователя: {user_query}"
 
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
         try:
+            # ПРАВИЛЬНЫЙ ВЫЗОВ GOOGLE GENAI:
+            # Промпт идет в config.system_instruction, а в contents ТОЛЬКО вопрос!
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
-                    contents=prompt,
+                    contents=user_query,
                     config=types.GenerateContentConfig(
-                        max_output_tokens=150,
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        max_output_tokens=200,
                         temperature=0.7,
                     )
                 ),
-                timeout=7.0
+                timeout=8.0
             )
             raw_text = getattr(response, "text", "")
             if raw_text and raw_text.strip():
-                # Вычищаем кавычки и слэши, чтобы не ломать JSON в Bash
-                clean_text = raw_text.replace('"', '').replace("'", "").replace('\\', '').strip()
+                # Убираем кавычки, переносы строк и спецсимволы
+                clean_text = " ".join(raw_text.split())
+                clean_text = clean_text.replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
                 print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
                 return clean_text
@@ -139,7 +137,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "stt": "faster-whisper-base"}
+    return {"status": "ok", "service": "capsule-server", "stt": "faster-whisper-base"}
 
 
 @app.post("/voice")
@@ -173,9 +171,8 @@ async def voice_endpoint(file: UploadFile = File(...)):
     audio_ready = await synthesize_voice(reply_text, audio_filename)
     total_time = time.perf_counter() - t_start
 
-    # Защита текста от ломающих кавычек
-    safe_user_said = recognized_text.replace('"', '').replace("'", "").replace('\\', '')
-    safe_reply = reply_text.replace('"', '').replace("'", "").replace('\\', '')
+    safe_user_said = " ".join(recognized_text.split()).replace('"', '').replace("'", "")
+    safe_reply = " ".join(reply_text.split()).replace('"', '').replace("'", "")
 
     return {
         "silent": False,
@@ -204,7 +201,7 @@ async def websocket_handler(websocket: WebSocket):
                 continue
 
             reply_text = await query_gemini_text(user_query)
-            audio_filename = f"reply_ws.mp3"
+            audio_filename = "reply_ws.mp3"
             audio_ready = await synthesize_voice(reply_text, audio_filename)
 
             await websocket.send_text(json.dumps({
