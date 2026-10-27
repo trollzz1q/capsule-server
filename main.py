@@ -3,6 +3,8 @@ import io
 import json
 import time
 import asyncio
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
@@ -15,19 +17,19 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Реальный поиск Google + Контекст). API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера Capsule Assistant. Gemini API: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-print("[*] Загрузка Faster-Whisper...", flush=True)
+print("[*] Инициализация Faster-Whisper (base, int8)...", flush=True)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-print("[+] STT готов!", flush=True)
+print("[+] Движок распознавания готов к работе!", flush=True)
 
 try:
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as e:
-    print(f"[!] Ошибка GenAI: {e}", flush=True)
+    print(f"[!] Ошибка GenAI Client: {e}", flush=True)
     client = None
 
 app = FastAPI(title="Capsule Assistant Backend")
@@ -35,11 +37,11 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный, дружелюбный и эрудированный голосовой ассистент смарт-колонки. "
+    "Твой хозяин живет в городе Новороссийск (если город не назван, всегда сообщай погоду для Новороссийска). "
     "Отвечай строго на русском языке! "
     "Давай полные, интересные, умные и живые ответы (2-4 предложения). "
-    "У тебя есть доступ к поиску Google в реальном времени. Если пользователь спрашивает о погоде, "
-    "новостях или текущих фактах — обязательно используй поиск и давай точную температуру и прогноз! "
-    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух."
+    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух. "
+    "Помни контекст текущего диалога с пользователем."
 )
 
 CASCADE_MODELS = [
@@ -64,17 +66,48 @@ def cleanup_old_audio():
             pass
 
 
+def fetch_weather_report(city: str = "Novorossiysk") -> str:
+    """Бесплатное получение актуальной погоды без ключей за 0.2 сек."""
+    try:
+        encoded = urllib.parse.quote(city.strip())
+        url = f"https://wttr.in/{encoded}?format=%l:+%C,+температура+%t,+ветер+%w&lang=ru"
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            data = resp.read().decode("utf-8").strip()
+            print(f"[+] Сводка погоды ({city}): '{data}'", flush=True)
+            return data
+    except Exception as e:
+        print(f"[!] Ошибка метеослужбы: {e}", flush=True)
+        return ""
+
+
 def get_history_with_query(user_query: str) -> list[types.Content]:
     global chat_history, last_interaction_time
     now = time.time()
 
     if now - last_interaction_time > 60.0:
         chat_history = []
-        print("[*] Контекст сброшен по таймауту (60с).", flush=True)
+        print("[*] Контекст сброшен по таймауту неактивности (60с).", flush=True)
 
     last_interaction_time = now
+
+    q_lower = user_query.lower()
+    prompt_with_data = user_query
+
+    # Если вопрос про погоду — забираем живой прогноз
+    if any(w in q_lower for w in ["погод", "градус", "дожд", "температур", "ветер", "тепло", "холод"]):
+        target_city = "Novorossiysk"
+        if "москв" in q_lower: target_city = "Moscow"
+        elif "питер" in q_lower or "петербург" in q_lower: target_city = "Saint Petersburg"
+        elif "краснодар" in q_lower: target_city = "Krasnodar"
+        elif "сочи" in q_lower: target_city = "Sochi"
+
+        weather_info = fetch_weather_report(target_city)
+        if weather_info:
+            prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {weather_info}]"
+
     chat_history.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=user_query)])
+        types.Content(role="user", parts=[types.Part.from_text(text=prompt_with_data)])
     )
     if len(chat_history) > 8:
         chat_history = chat_history[-8:]
@@ -117,26 +150,24 @@ async def query_gemini_with_context(user_query: str) -> str:
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
         try:
-            # Включаем поиск Google Grounding для погоды и фактов реального времени
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
                     contents=full_context_contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
-                        tools=[types.Tool(google_search=types.GoogleSearch())],  # РЕАЛЬНЫЙ ПОИСК GOOGLE!
                         max_output_tokens=350,
                         temperature=0.7,
                     )
                 ),
-                timeout=14.0
+                timeout=12.0
             )
 
             raw_text = getattr(response, "text", "")
             if raw_text:
                 clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
                 dt = time.perf_counter() - t0
-                print(f"[+] {model_name} с поиском ({dt:.2f}с): '{clean_text}'", flush=True)
+                print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
                 append_assistant_reply(clean_text)
                 return clean_text
 
@@ -158,7 +189,8 @@ async def synthesize_voice(text: str, filename: str) -> bool:
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"[!] Ошибка озвучки ({voice}): {e}", flush=True)
             continue
     return False
 
@@ -166,7 +198,14 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "search": "enabled"}
+    return {"status": "ok", "service": "capsule-server", "weather": "active", "stt": "faster-whisper-base"}
+
+
+@app.post("/reset")
+async def reset_context():
+    global chat_history
+    chat_history = []
+    return {"status": "ok", "message": "Контекст диалога очищен"}
 
 
 @app.post("/voice")
@@ -184,7 +223,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
         if not recognized_text or recognized_text in [".", "...", "!", "?"]:
             dt = round(time.perf_counter() - t_start, 2)
-            print(f"[+] Чистая тишина ({dt}с).", flush=True)
+            print(f"[+] Зафиксирована чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
         reply_text = await query_gemini_with_context(recognized_text)
@@ -209,5 +248,5 @@ async def voice_endpoint(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        print(f"[!] Ошибка: {e}", flush=True)
+        print(f"[!] Ошибка voice_endpoint: {e}", flush=True)
         return {"silent": False, "text": "Сбой сервера", "audio_ready": False, "audio_url": None}
