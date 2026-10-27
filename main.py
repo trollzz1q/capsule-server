@@ -32,20 +32,19 @@ SYSTEM_PROMPT = (
 )
 
 FAST_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-3.8-flash",
 ]
 
 async def ask_gemini(user_text: str) -> str:
     global client
     if not GEMINI_API_KEY:
-        return "ОШИБКА: GEMINI_API_KEY не задан в .env"
+        print("[!] GEMINI_API_KEY не задан", flush=True)
+        return "В настройках сервера не указан API-ключ."
 
     if client is None:
         client = genai.Client(api_key=GEMINI_API_KEY)
 
     full_prompt = f"{SYSTEM_PROMPT}\nВопрос пользователя: {user_text}"
-    last_error = "Неизвестная ошибка"
 
     for model_name in FAST_MODELS:
         t0 = time.perf_counter()
@@ -62,16 +61,11 @@ async def ask_gemini(user_text: str) -> str:
             if response and response.text:
                 print(f"[+] {model_name} ответила за {dt:.2f} сек", flush=True)
                 return response.text.strip()
-        except asyncio.TimeoutError:
-            last_error = f"TimeoutError ({model_name})"
-            print(f"[!] {last_error}", flush=True)
         except Exception as e:
-            # Сохраняем точный текст исключения Google API
-            last_error = f"{model_name} -> {repr(e)}"
-            print(f"[!] Сбой вызова {last_error}", flush=True)
+            print(f"[!] Сбой вызова {model_name}: {repr(e)}", flush=True)
+            continue
 
-    # Вместо заглушки возвращаем точную ошибку прямо в чат/клиент:
-    return f"ОШИБКА_API: {last_error}"
+    return "Сервер перегружен, спроси чуть позже."
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
