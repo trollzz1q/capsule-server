@@ -17,7 +17,7 @@ import edge_tts
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Надежная память диалога + Погода). API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (Команды + Диалог). API: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -36,12 +36,14 @@ app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
 SYSTEM_INSTRUCTION = (
-    "Ты — Сима, умный, дружелюбный и эрудированный голосовой ассистент смарт-колонки. "
-    "Твой хозяин живет в городе Новороссийск (если город не назван, всегда сообщай погоду для Новороссийска). "
+    "Ты — Сима, умный голосовой ассистент смарт-колонки в Новороссийске. "
     "Отвечай строго на русском языке! "
-    "Давай полные, интересные, умные и живые ответы (2-4 предложения). "
-    "Не используй markdown, звездочки, списки и таблицы, так как ответ озвучивается вслух. "
-    "Помни контекст текущего диалога с пользователем."
+    "Если пользователь просто общается, задает вопрос или просит совет — отвечай живо, емко и интересно (2-3 предложения). "
+    "ВАЖНО ПО КОМАНДАМ: Если пользователь отдает команду (громкость, плеер, лайк), верни ответ строго в формате JSON: "
+    "1. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Поставила громкость на 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила звук\"} "
+    "2. Музыка: {\"action\": \"music\", \"cmd\": \"play\", \"query\": \"фонк\", \"reply\": \"Включаю фонк\"} "
+    "3. Управление треком: {\"action\": \"music\", \"cmd\": \"next|prev|pause|resume|like\", \"reply\": \"Переключаю\"} "
+    "Если это не команда управления — отвечай просто обычным текстом без JSON, списков и markdown."
 )
 
 CASCADE_MODELS = [
@@ -52,8 +54,6 @@ CASCADE_MODELS = [
 ]
 
 file_counter = 0
-
-# --- СТАБИЛЬНАЯ ПАМЯТЬ НА СЛОВАРЯХ PYTHON ---
 chat_history: list[dict] = []
 last_interaction_time: float = 0.0
 
@@ -69,7 +69,6 @@ def cleanup_old_audio():
 
 
 def fetch_weather_report(city: str = "Novorossiysk") -> str:
-    """Бесплатное получение живой погоды без API ключей."""
     try:
         encoded = urllib.parse.quote(city.strip())
         url = f"https://wttr.in/{encoded}?format=%l:+%C,+температура+%t,+ветер+%w&lang=ru"
@@ -84,20 +83,18 @@ def fetch_weather_report(city: str = "Novorossiysk") -> str:
 
 
 def get_history_with_query(user_query: str) -> list[dict]:
-    """Формирует историю в нативном формате словарей Gemini."""
     global chat_history, last_interaction_time
     now = time.time()
 
     if now - last_interaction_time > 60.0:
         chat_history = []
-        print("[*] Память диалога сброшена по таймауту (60с).", flush=True)
+        print("[*] Контекст сброшен по таймауту (60с).", flush=True)
 
     last_interaction_time = now
 
     q_lower = user_query.lower()
     prompt_with_data = user_query
 
-    # Если спросили про погоду — добавляем живые цифры
     if any(w in q_lower for w in ["погод", "градус", "дожд", "температур", "ветер", "тепло", "холод"]):
         target_city = "Novorossiysk"
         if "москв" in q_lower: target_city = "Moscow"
@@ -109,7 +106,6 @@ def get_history_with_query(user_query: str) -> list[dict]:
         if weather_info:
             prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {weather_info}]"
 
-    # Добавляем реплику пользователя через чистый словарь
     chat_history.append({
         "role": "user",
         "parts": [{"text": prompt_with_data}]
@@ -122,7 +118,6 @@ def get_history_with_query(user_query: str) -> list[dict]:
 
 
 def append_assistant_reply(reply_text: str):
-    """Сохраняет ответ ассистента в историю."""
     global chat_history
     chat_history.append({
         "role": "model",
@@ -137,7 +132,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, города России, Новороссийск, погода.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, громкость, музыка, трек, погода.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -149,9 +144,10 @@ def local_stt(audio_bytes: bytes) -> str:
         return ""
 
 
-async def query_gemini_with_context(user_query: str) -> str:
+async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
+    """Возвращает (текст_для_озвучки, команда_для_колонки)."""
     if not client or not GEMINI_API_KEY:
-        return "В настройках сервера не указан API ключ."
+        return "В настройках сервера не указан API ключ.", {}
 
     full_context = get_history_with_query(user_query)
 
@@ -161,11 +157,11 @@ async def query_gemini_with_context(user_query: str) -> str:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
-                    contents=full_context,  # ЧИСТЫЙ СПИСОК СЛОВАРЕЙ (БЕЗ БАГОВ)
+                    contents=full_context,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         max_output_tokens=350,
-                        temperature=0.7,
+                        temperature=0.6,
                     )
                 ),
                 timeout=12.0
@@ -173,17 +169,31 @@ async def query_gemini_with_context(user_query: str) -> str:
 
             raw_text = getattr(response, "text", "")
             if raw_text:
-                clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
+                clean_text = " ".join(raw_text.split()).strip()
                 dt = time.perf_counter() - t0
                 print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
-                append_assistant_reply(clean_text)
-                return clean_text
+
+                # Проверяем, вернула ли модель команду в JSON
+                command_payload = {}
+                speech_text = clean_text
+
+                if clean_text.startswith("{") and clean_text.endswith("}"):
+                    try:
+                        parsed = json.loads(clean_text)
+                        command_payload = parsed
+                        speech_text = parsed.get("reply", "Сделано")
+                    except Exception:
+                        pass
+
+                speech_text = speech_text.replace('"', '').replace("'", "").replace('\\', '').strip()
+                append_assistant_reply(speech_text)
+                return speech_text, command_payload
 
         except Exception as e:
-            print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
+            print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
             continue
 
-    return "Сервер задумался, спроси еще разок."
+    return "Сервер задумался, спроси еще разок.", {}
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
@@ -197,8 +207,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
-        except Exception as e:
-            print(f"[!] Ошибка озвучки ({voice}): {e}", flush=True)
+        except Exception:
             continue
     return False
 
@@ -206,14 +215,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "context_turns": len(chat_history)}
-
-
-@app.post("/reset")
-async def reset_context():
-    global chat_history
-    chat_history = []
-    return {"status": "ok", "message": "Память диалога сброшена"}
+    return {"status": "ok", "service": "capsule-server", "features": ["weather", "commands", "stt"]}
 
 
 @app.post("/voice")
@@ -234,7 +236,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             print(f"[+] Чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
-        reply_text = await query_gemini_with_context(recognized_text)
+        reply_text, cmd_payload = await query_gemini_with_context(recognized_text)
 
         file_counter = (file_counter % 10) + 1
         audio_filename = f"reply_{file_counter}.mp3"
@@ -250,6 +252,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             "silent": False,
             "text": safe_reply,
             "user_said": safe_user_said,
+            "command": cmd_payload,
             "audio_ready": audio_ready,
             "audio_url": f"/audio/{audio_filename}" if audio_ready else None,
             "latency_sec": round(total_time, 2),
