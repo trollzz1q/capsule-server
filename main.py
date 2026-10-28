@@ -41,30 +41,30 @@ SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный голосовой ассистент смарт-колонки в Новороссийске. "
     "Отвечай строго на русском языке! "
     "Если пользователь просто общается или задает вопрос — отвечай полно, интересно и живо (2-3 предложения). "
-    "ВАЖНО: Если пользователь отдает команду (музыка, громкость, лайк), верни ответ СТРОГО в формате JSON без кавычек и markdown вокруг: "
+    "ВАЖНО: Если пользователь отдает команду (музыка, громкость, лайк), верни ответ СТРОГО в формате JSON без markdown: "
     "1. Включить личный плейлист (мой плейлист, моя музыка, мои треки, любимое): "
     "{\"action\": \"music\", \"cmd\": \"my_playlist\", \"reply\": \"Включаю твой плейлист из Саундклауда\"} "
     "2. Включить трек/жанр (включи фонк, поставь рок, включи песню X): "
     "{\"action\": \"music\", \"cmd\": \"play\", \"query\": \"название_или_жанр\", \"reply\": \"Включаю трек\"} "
-    "3. Переключение и лайки: "
+    "3. Управление треком: "
     "{\"action\": \"music\", \"cmd\": \"next\", \"reply\": \"Следующий трек\"} "
     "{\"action\": \"music\", \"cmd\": \"prev\", \"reply\": \"Предыдущий трек\"} "
     "{\"action\": \"music\", \"cmd\": \"like\", \"reply\": \"Добавила в твои лайки\"} "
     "{\"action\": \"music\", \"cmd\": \"pause\", \"reply\": \"Музыка на паузе\"} "
     "{\"action\": \"music\", \"cmd\": \"resume\", \"reply\": \"Продолжаю воспроизведение\"} "
     "4. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Громкость 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила\"} "
-    "Если это обычный вопрос без команд — отвечай просто чистым текстом без JSON."
+    "Если это обычный вопрос без команд — отвечай просто текстом."
 )
 
+# ТОЛЬКО АКТУАЛЬНЫЕ МОДЕЛИ (БЕЗ УСТАРЕВШЕЙ 2.5-lite)
 CASCADE_MODELS = [
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.8-flash"
 ]
 
 file_counter = 0
-chat_history: list[dict] = []
+dialogue_history = []
 last_interaction_time: float = 0.0
 
 
@@ -86,39 +86,50 @@ def fetch_weather_report(city: str = "Novorossiysk") -> str:
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = resp.read().decode("utf-8").strip()
             return data
-    except Exception as e:
+    except Exception:
         return ""
 
 
-def get_history_with_query(user_query: str) -> list[dict]:
-    global chat_history, last_interaction_time
+def build_full_prompt(user_query: str) -> str:
+    """Формирует контекст в виде чистого плоского текста (без багов SDK)."""
+    global dialogue_history, last_interaction_time
     now = time.time()
 
     if now - last_interaction_time > 60.0:
-        chat_history = []
+        dialogue_history = []
         print("[*] Контекст сброшен по таймауту (60с).", flush=True)
 
     last_interaction_time = now
     q_lower = user_query.lower()
-    prompt_with_data = user_query
 
+    weather_injection = ""
     if any(w in q_lower for w in ["погод", "градус", "дожд", "температур", "ветер", "тепло", "холод"]):
         target_city = "Novorossiysk"
         if "москв" in q_lower: target_city = "Moscow"
         elif "питер" in q_lower or "петербург" in q_lower: target_city = "Saint Petersburg"
         w_data = fetch_weather_report(target_city)
         if w_data:
-            prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {w_data}]"
+            weather_injection = f"\n[АКТУАЛЬНАЯ ПОГОДА: {w_data}]"
 
-    chat_history.append({"role": "user", "parts": [{"text": prompt_with_data}]})
-    if len(chat_history) > 8:
-        chat_history = chat_history[-8:]
-    return list(chat_history)
+    query_with_data = f"{user_query}{weather_injection}"
+
+    # Собираем историю диалога в читаемый вид
+    context_lines = []
+    for role, text in dialogue_history[-6:]:
+        prefix = "Пользователь:" if role == "user" else "Сима:"
+        context_lines.append(f"{prefix} {text}")
+
+    context_lines.append(f"Пользователь: {query_with_data}")
+    dialogue_history.append(("user", user_query))
+
+    return "\n".join(context_lines)
 
 
-def append_assistant_reply(reply_text: str):
-    global chat_history
-    chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
+def record_assistant_reply(reply_text: str):
+    global dialogue_history
+    dialogue_history.append(("model", reply_text))
+    if len(dialogue_history) > 8:
+        dialogue_history = dialogue_history[-8:]
 
 
 def local_stt(audio_bytes: bytes) -> str:
@@ -128,7 +139,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, музыка, саундклауд, плейлист, лайк, трек, погода.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, трек, включи, музыка, саундклауд, плейлист, лайк, погода.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -141,11 +152,11 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
-    """Генерация с разбором намерений (чат vs музыка vs громкость)."""
+    """Сверхбыстрый запрос без зависаний."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ.", {}
 
-    full_context = get_history_with_query(user_query)
+    full_prompt = build_full_prompt(user_query)
 
     for model_name in CASCADE_MODELS:
         t0 = time.perf_counter()
@@ -153,14 +164,14 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
-                    contents=full_context,
+                    contents=full_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
                         max_output_tokens=300,
                         temperature=0.5,
                     )
                 ),
-                timeout=12.0
+                timeout=8.0  # Быстрый таймаут — если модель спит, сразу переключаем на следующую
             )
 
             raw_text = getattr(response, "text", "")
@@ -172,7 +183,6 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
                 cmd_payload = {}
                 speech_text = clean_text
 
-                # Проверяем, вернула ли модель команду
                 if "{" in clean_text and "}" in clean_text:
                     try:
                         start_idx = clean_text.find("{")
@@ -184,11 +194,14 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
                         pass
 
                 speech_text = speech_text.replace('"', '').replace("'", "").replace('\\', '').strip()
-                append_assistant_reply(speech_text)
+                record_assistant_reply(speech_text)
                 return speech_text, cmd_payload
 
+        except asyncio.TimeoutError:
+            print(f"[!] Таймаут 8с на {model_name}. Переключаем...", flush=True)
+            continue
         except Exception as e:
-            print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
+            print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
             continue
 
     return "Сервер задумался, спроси еще разок.", {}
@@ -236,7 +249,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
         reply_text, cmd_payload = await query_gemini_with_context(recognized_text)
 
-        # --- ОБРАБОТКА МУЗЫКАЛЬНЫХ КОМАНД ЧЕРЕЗ SOUNDCLOUD ---
+        # Обработка команд SoundCloud
         music_response = {}
         if cmd_payload.get("action") == "music":
             cmd = cmd_payload.get("cmd")
