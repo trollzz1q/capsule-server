@@ -14,10 +14,12 @@ from google.genai import types
 from faster_whisper import WhisperModel
 import edge_tts
 
+import soundcloud_engine as sc
+
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (Команды + Диалог). API: {bool(GEMINI_API_KEY)}", flush=True)
+print(f"[*] Старт сервера (SoundCloud + Диалог). API: {bool(GEMINI_API_KEY)}", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -38,12 +40,20 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный голосовой ассистент смарт-колонки в Новороссийске. "
     "Отвечай строго на русском языке! "
-    "Если пользователь просто общается, задает вопрос или просит совет — отвечай живо, емко и интересно (2-3 предложения). "
-    "ВАЖНО ПО КОМАНДАМ: Если пользователь отдает команду (громкость, плеер, лайк), верни ответ строго в формате JSON: "
-    "1. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Поставила громкость на 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила звук\"} "
-    "2. Музыка: {\"action\": \"music\", \"cmd\": \"play\", \"query\": \"фонк\", \"reply\": \"Включаю фонк\"} "
-    "3. Управление треком: {\"action\": \"music\", \"cmd\": \"next|prev|pause|resume|like\", \"reply\": \"Переключаю\"} "
-    "Если это не команда управления — отвечай просто обычным текстом без JSON, списков и markdown."
+    "Если пользователь просто общается или задает вопрос — отвечай полно, интересно и живо (2-3 предложения). "
+    "ВАЖНО: Если пользователь отдает команду (музыка, громкость, лайк), верни ответ СТРОГО в формате JSON без кавычек и markdown вокруг: "
+    "1. Включить личный плейлист (мой плейлист, моя музыка, мои треки, любимое): "
+    "{\"action\": \"music\", \"cmd\": \"my_playlist\", \"reply\": \"Включаю твой плейлист из Саундклауда\"} "
+    "2. Включить трек/жанр (включи фонк, поставь рок, включи песню X): "
+    "{\"action\": \"music\", \"cmd\": \"play\", \"query\": \"название_или_жанр\", \"reply\": \"Включаю трек\"} "
+    "3. Переключение и лайки: "
+    "{\"action\": \"music\", \"cmd\": \"next\", \"reply\": \"Следующий трек\"} "
+    "{\"action\": \"music\", \"cmd\": \"prev\", \"reply\": \"Предыдущий трек\"} "
+    "{\"action\": \"music\", \"cmd\": \"like\", \"reply\": \"Добавила в твои лайки\"} "
+    "{\"action\": \"music\", \"cmd\": \"pause\", \"reply\": \"Музыка на паузе\"} "
+    "{\"action\": \"music\", \"cmd\": \"resume\", \"reply\": \"Продолжаю воспроизведение\"} "
+    "4. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Громкость 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила\"} "
+    "Если это обычный вопрос без команд — отвечай просто чистым текстом без JSON."
 )
 
 CASCADE_MODELS = [
@@ -75,10 +85,8 @@ def fetch_weather_report(city: str = "Novorossiysk") -> str:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = resp.read().decode("utf-8").strip()
-            print(f"[+] Погода ({city}): '{data}'", flush=True)
             return data
     except Exception as e:
-        print(f"[!] Ошибка wttr.in: {e}", flush=True)
         return ""
 
 
@@ -91,7 +99,6 @@ def get_history_with_query(user_query: str) -> list[dict]:
         print("[*] Контекст сброшен по таймауту (60с).", flush=True)
 
     last_interaction_time = now
-
     q_lower = user_query.lower()
     prompt_with_data = user_query
 
@@ -99,30 +106,19 @@ def get_history_with_query(user_query: str) -> list[dict]:
         target_city = "Novorossiysk"
         if "москв" in q_lower: target_city = "Moscow"
         elif "питер" in q_lower or "петербург" in q_lower: target_city = "Saint Petersburg"
-        elif "краснодар" in q_lower: target_city = "Krasnodar"
-        elif "сочи" in q_lower: target_city = "Sochi"
+        w_data = fetch_weather_report(target_city)
+        if w_data:
+            prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {w_data}]"
 
-        weather_info = fetch_weather_report(target_city)
-        if weather_info:
-            prompt_with_data = f"{user_query}\n[АКТУАЛЬНЫЕ МЕТЕОДАННЫЕ: {weather_info}]"
-
-    chat_history.append({
-        "role": "user",
-        "parts": [{"text": prompt_with_data}]
-    })
-
+    chat_history.append({"role": "user", "parts": [{"text": prompt_with_data}]})
     if len(chat_history) > 8:
         chat_history = chat_history[-8:]
-
     return list(chat_history)
 
 
 def append_assistant_reply(reply_text: str):
     global chat_history
-    chat_history.append({
-        "role": "model",
-        "parts": [{"text": reply_text}]
-    })
+    chat_history.append({"role": "model", "parts": [{"text": reply_text}]})
 
 
 def local_stt(audio_bytes: bytes) -> str:
@@ -132,7 +128,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, громкость, музыка, трек, погода.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, музыка, саундклауд, плейлист, лайк, трек, погода.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -145,7 +141,7 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
-    """Возвращает (текст_для_озвучки, команда_для_колонки)."""
+    """Генерация с разбором намерений (чат vs музыка vs громкость)."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ.", {}
 
@@ -160,8 +156,8 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
                     contents=full_context,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_INSTRUCTION,
-                        max_output_tokens=350,
-                        temperature=0.6,
+                        max_output_tokens=300,
+                        temperature=0.5,
                     )
                 ),
                 timeout=12.0
@@ -173,21 +169,23 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
                 dt = time.perf_counter() - t0
                 print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
 
-                # Проверяем, вернула ли модель команду в JSON
-                command_payload = {}
+                cmd_payload = {}
                 speech_text = clean_text
 
-                if clean_text.startswith("{") and clean_text.endswith("}"):
+                # Проверяем, вернула ли модель команду
+                if "{" in clean_text and "}" in clean_text:
                     try:
-                        parsed = json.loads(clean_text)
-                        command_payload = parsed
-                        speech_text = parsed.get("reply", "Сделано")
+                        start_idx = clean_text.find("{")
+                        end_idx = clean_text.rfind("}") + 1
+                        parsed = json.loads(clean_text[start_idx:end_idx])
+                        cmd_payload = parsed
+                        speech_text = parsed.get("reply", "Готово")
                     except Exception:
                         pass
 
                 speech_text = speech_text.replace('"', '').replace("'", "").replace('\\', '').strip()
                 append_assistant_reply(speech_text)
-                return speech_text, command_payload
+                return speech_text, cmd_payload
 
         except Exception as e:
             print(f"[!] Сбой {model_name}: {e}. Переключаем...", flush=True)
@@ -215,7 +213,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "features": ["weather", "commands", "stt"]}
+    return {"status": "ok", "service": "capsule-server", "soundcloud": bool(sc.SOUNDCLOUD_AUTH_TOKEN)}
 
 
 @app.post("/voice")
@@ -238,6 +236,39 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
         reply_text, cmd_payload = await query_gemini_with_context(recognized_text)
 
+        # --- ОБРАБОТКА МУЗЫКАЛЬНЫХ КОМАНД ЧЕРЕЗ SOUNDCLOUD ---
+        music_response = {}
+        if cmd_payload.get("action") == "music":
+            cmd = cmd_payload.get("cmd")
+            if cmd == "my_playlist":
+                res = await loop.run_in_executor(None, sc.load_my_liked_tracks)
+                if res.get("success"):
+                    music_response = {"action": "play_stream", "stream_url": res["stream_url"], "title": res["title"]}
+                    reply_text = f"Включаю твой плейлист: {res['title']}"
+            elif cmd == "play":
+                query = cmd_payload.get("query", "music")
+                res = await loop.run_in_executor(None, sc.search_and_get_track, query)
+                if res.get("success"):
+                    music_response = {"action": "play_stream", "stream_url": res["stream_url"], "title": res["title"]}
+                    reply_text = f"Включаю: {res['title']}"
+            elif cmd == "next":
+                res = await loop.run_in_executor(None, sc.get_next_track)
+                if res.get("success"):
+                    music_response = {"action": "play_stream", "stream_url": res["stream_url"], "title": res["title"]}
+                    reply_text = f"Следующий трек: {res['title']}"
+            elif cmd == "prev":
+                res = await loop.run_in_executor(None, sc.get_prev_track)
+                if res.get("success"):
+                    music_response = {"action": "play_stream", "stream_url": res["stream_url"], "title": res["title"]}
+                    reply_text = f"Предыдущий трек: {res['title']}"
+            elif cmd == "like":
+                liked = await loop.run_in_executor(None, sc.like_current_playing_track)
+                reply_text = "Добавила в твои любимые треки" if liked else "Не удалось поставить лайк"
+            elif cmd == "pause":
+                music_response = {"action": "music_pause"}
+            elif cmd == "resume":
+                music_response = {"action": "music_resume"}
+
         file_counter = (file_counter % 10) + 1
         audio_filename = f"reply_{file_counter}.mp3"
 
@@ -253,6 +284,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             "text": safe_reply,
             "user_said": safe_user_said,
             "command": cmd_payload,
+            "music": music_response,
             "audio_ready": audio_ready,
             "audio_url": f"/audio/{audio_filename}" if audio_ready else None,
             "latency_sec": round(total_time, 2),
