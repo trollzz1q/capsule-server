@@ -15,6 +15,7 @@ from faster_whisper import WhisperModel
 import edge_tts
 
 import soundcloud_engine as sc
+from stream_proxy import router as stream_router
 
 load_dotenv(override=True)
 
@@ -36,6 +37,7 @@ except Exception as e:
 
 app = FastAPI(title="Capsule Assistant Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+app.include_router(stream_router)
 
 SYSTEM_INSTRUCTION = (
     "Ты — Сима, умный голосовой ассистент смарт-колонки в Новороссийске. "
@@ -53,10 +55,9 @@ SYSTEM_INSTRUCTION = (
     "{\"action\": \"music\", \"cmd\": \"pause\", \"reply\": \"Музыка на паузе\"} "
     "{\"action\": \"music\", \"cmd\": \"resume\", \"reply\": \"Продолжаю воспроизведение\"} "
     "4. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Громкость 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила\"} "
-    "Если это обычный вопрос без команд — отвечай просто текстом."
+    "Если это обычный вопрос без команд — отвечай просто чистым текстом."
 )
 
-# ТОЛЬКО АКТУАЛЬНЫЕ МОДЕЛИ (БЕЗ УСТАРЕВШЕЙ 2.5-lite)
 CASCADE_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
@@ -91,7 +92,6 @@ def fetch_weather_report(city: str = "Novorossiysk") -> str:
 
 
 def build_full_prompt(user_query: str) -> str:
-    """Формирует контекст в виде чистого плоского текста (без багов SDK)."""
     global dialogue_history, last_interaction_time
     now = time.time()
 
@@ -113,7 +113,6 @@ def build_full_prompt(user_query: str) -> str:
 
     query_with_data = f"{user_query}{weather_injection}"
 
-    # Собираем историю диалога в читаемый вид
     context_lines = []
     for role, text in dialogue_history[-6:]:
         prefix = "Пользователь:" if role == "user" else "Сима:"
@@ -152,7 +151,6 @@ def local_stt(audio_bytes: bytes) -> str:
 
 
 async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
-    """Сверхбыстрый запрос без зависаний."""
     if not client or not GEMINI_API_KEY:
         return "В настройках сервера не указан API ключ.", {}
 
@@ -171,7 +169,7 @@ async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
                         temperature=0.5,
                     )
                 ),
-                timeout=8.0  # Быстрый таймаут — если модель спит, сразу переключаем на следующую
+                timeout=8.0
             )
 
             raw_text = getattr(response, "text", "")
@@ -249,7 +247,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
 
         reply_text, cmd_payload = await query_gemini_with_context(recognized_text)
 
-        # Обработка команд SoundCloud
+        # Обработка действий SoundCloud
         music_response = {}
         if cmd_payload.get("action") == "music":
             cmd = cmd_payload.get("cmd")

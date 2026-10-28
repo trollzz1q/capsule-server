@@ -9,3 +9,4 @@ google-genai
 faster-whisper
 edge-tts
 yt-dlp
+imageio-ffmpeg
