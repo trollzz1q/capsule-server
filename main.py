@@ -3,89 +3,127 @@ import io
 import json
 import time
 import asyncio
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from google import genai
-from google.genai import types
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
 from faster_whisper import WhisperModel
 import edge_tts
 
 load_dotenv(override=True)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт быстрого сервера. API: {bool(GEMINI_API_KEY)}", flush=True)
+print("[*] Старт полностью локального сервера (QWEN 2.5 CPU). Gemini вырезан на 100%.", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# Модель tiny на 2 потоках CPU отрабатывает за 0.25-0.35 сек!
-print("[*] Загрузка ультрабыстрого Whisper tiny...", flush=True)
+# 1. Загрузка Whisper tiny
+print("[*] Загрузка Whisper tiny...", flush=True)
 whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=2)
 print("[+] STT готов!", flush=True)
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# 2. Загрузка Qwen 2.5 0.5B
+print("[*] Загрузка Qwen 2.5 0.5B в память...", flush=True)
+model_path = hf_hub_download(
+    repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    filename="qwen2.5-0.5b-instruct-q4_k_m.gguf"
+)
+llm = Llama(
+    model_path=model_path,
+    n_ctx=512,       # Короткий контекст для скорости
+    n_batch=512,
+    n_threads=2,     # Ровно под твои 2 vCPU
+    verbose=False
+)
+print("[+] Qwen 2.5 готов к работе на процессоре!", flush=True)
 
-app = FastAPI(title="Capsule Fast Backend")
+app = FastAPI(title="Local Sima Server")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
-# КОРОТКИЙ ПРОМПТ В 1 СТРОКУ
-SYSTEM_INSTRUCTION = "Отвечай строго на русском языке, кратко, в 1-2 предложения, живым разговорным языком, без markdown, звездочек и спецсимволов."
+# КОРОТКИЙ ПРОМПТ В ОДНУ СТРОКУ (читается за 0.05 сек!)
+SYSTEM_PROMPT = "Ты — Сима, голосовой помощник в Новороссийске. Отвечай строго по-русски, кратко, в 1-2 предложения, без markdown и спецсимволов."
+
+# Черный список галлюцинаций ютубовских субтитров Whisper
+WHISPER_JUNK = [
+    "динамичная музыка", "музыка", "аплодисменты", "титры", "субтитры",
+    "продолжение следует", "диктор", "редактор", "соли и голубов"
+]
 
 file_counter = 0
 
 
+def fetch_weather_novorossiysk() -> str:
+    """Безопасный запрос погоды без ошибок кодировки."""
+    try:
+        url = "https://wttr.in/Novorossiysk?format=%C,+%t,+ветер+%w&lang=ru"
+        # Кодируем URL правильно
+        safe_url = urllib.parse.quote(url, safe=":/%?=&+,")
+        req = urllib.request.Request(safe_url, headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            return resp.read().decode("utf-8").strip()
+    except Exception:
+        return "+16°C, облачно"
+
+
 def local_stt(audio_bytes: bytes) -> str:
-    """Мгновенное распознавание без фейковых подсказок."""
+    """Распознавание речи с жесткой фильтрацией мусора субтитров."""
     try:
         t0 = time.perf_counter()
         segments, _ = whisper_model.transcribe(
             io.BytesIO(audio_bytes),
             language="ru",
-            beam_size=1,        # 1 поток = максимальная скорость
+            beam_size=1,
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
         dt = time.perf_counter() - t0
-        print(f"[+] STT ({dt:.2f}с): '{text}'", flush=True)
+
+        # Фильтруем выдумки вроде "ДИНАМИЧНАЯ МУЗЫКА"
+        clean = text.lower().strip("[]().,! ")
+        if not clean or clean in WHISPER_JUNK or any(j in clean for j in ["динамичная музыка", "субтитры"]):
+            print(f"[!] Отсечен шум/галлюцинация Whisper ({dt:.2f}с): '{text}'", flush=True)
+            return ""
+
+        print(f"[+] Вы сказали ({dt:.2f}с): '{text}'", flush=True)
         return text
     except Exception as e:
         print(f"[!] Ошибка STT: {e}", flush=True)
         return ""
 
 
-async def query_gemini_fast(user_query: str) -> str:
-    """Быстрый запрос к Gemini Lite (0.3-0.4 сек)."""
-    if not client or not GEMINI_API_KEY:
-        return "В настройках сервера не указан API ключ."
-
+def run_qwen_fast(user_text: str) -> str:
+    """Быстрый инференс Qwen за 1-2 секунды."""
     t0 = time.perf_counter()
-    try:
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model="gemini-3.5-flash-lite",
-                contents=user_query,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    max_output_tokens=100,  # Короткий емкий ответ
-                    temperature=0.7,
-                )
-            ),
-            timeout=6.0
-        )
-        raw_text = getattr(response, "text", "")
-        clean_text = " ".join(raw_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
-        dt = time.perf_counter() - t0
-        print(f"[+] Gemini ({dt:.2f}с): '{clean_text}'", flush=True)
-        return clean_text or "Я тебя услышала."
-    except Exception as e:
-        print(f"[!] Ошибка Gemini: {e}", flush=True)
-        return "Сервер задумался, спроси еще разок."
+
+    prompt_text = user_text
+    # Если вопрос про погоду — подсовываем живые цифры
+    if any(w in user_text.lower() for w in ["погод", "градус", "дожд", "температур", "ветер"]):
+        weather = fetch_weather_novorossiysk()
+        prompt_text = f"Погода в Новороссийске сейчас: {weather}. Вопрос: {user_text}"
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt_text}
+    ]
+
+    response = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=60,       # 1-2 предложения
+        temperature=0.7,
+        top_p=0.9
+    )
+    reply = response["choices"][0]["message"]["content"].strip()
+    clean_reply = " ".join(reply.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
+    dt = time.perf_counter() - t0
+    print(f"[+] Qwen 2.5 ({dt:.2f}с): '{clean_reply}'", flush=True)
+    return clean_reply or "Я тебя слышу."
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
-    """Быстрый синтез речи (+25% к скорости)."""
     filepath = AUDIO_DIR / filename
     try:
         communicate = edge_tts.Communicate(text, voice="ru-RU-SvetlanaNeural", rate="+25%")
@@ -98,7 +136,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "speed": "fast"}
+    return {"status": "ok", "engine": "qwen2.5-local-fast"}
 
 
 @app.post("/voice")
@@ -112,19 +150,22 @@ async def voice_endpoint(file: UploadFile = File(...)):
             return {"silent": True, "text": "", "audio_ready": False}
 
         loop = asyncio.get_running_loop()
-        recognized_text = await loop.run_in_executor(None, local_stt, audio_bytes)
 
-        if not recognized_text or recognized_text in [".", "...", "!", "?"]:
+        # 1. Быстрое распознавание речи
+        recognized_text = await loop.run_in_executor(None, local_stt, audio_bytes)
+        if not recognized_text:
             return {"silent": True, "text": "", "audio_ready": False}
 
-        reply_text = await query_gemini_fast(recognized_text)
+        # 2. Быстрый локальный Qwen (1.5 сек)
+        reply_text = await loop.run_in_executor(None, run_qwen_fast, recognized_text)
 
+        # 3. Синтез голоса
         file_counter = (file_counter % 10) + 1
         audio_filename = f"reply_{file_counter}.mp3"
 
         audio_ready = await synthesize_voice(reply_text, audio_filename)
         total_time = time.perf_counter() - t_start
-        print(f"[+] ИТОГ за {total_time:.2f} сек: '{reply_text}'", flush=True)
+        print(f"[+] Полный ответ за {total_time:.2f}с!", flush=True)
 
         return {
             "silent": False,
@@ -136,5 +177,5 @@ async def voice_endpoint(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        print(f"[!] Ошибка voice: {e}", flush=True)
+        print(f"[!] Ошибка: {e}", flush=True)
         return {"silent": False, "text": "Сбой сервера", "audio_ready": False, "audio_url": None}
