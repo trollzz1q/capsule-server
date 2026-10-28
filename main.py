@@ -9,60 +9,55 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from google import genai
-from google.genai import types
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
 from faster_whisper import WhisperModel
 import edge_tts
 
 import soundcloud_engine as sc
-from stream_proxy import router as stream_router
 
 load_dotenv(override=True)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-print(f"[*] Старт сервера (SoundCloud + Диалог). API: {bool(GEMINI_API_KEY)}", flush=True)
+print("[*] Старт полностью автономного сервера (Qwen 2.5 0.5B Local).", flush=True)
 
 AUDIO_DIR = Path("static_audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-print("[*] Загрузка Faster-Whisper...", flush=True)
+# 1. Загрузка STT Whisper
+print("[*] Инициализация Faster-Whisper (base, int8)...", flush=True)
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 print("[+] STT готов!", flush=True)
 
-try:
-    client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-except Exception as e:
-    print(f"[!] Ошибка GenAI: {e}", flush=True)
-    client = None
+# 2. Скачивание и инициализация локальной модели Qwen 2.5 0.5B
+print("[*] Подготовка модели Qwen 2.5 0.5B Instruct GGUF...", flush=True)
+model_path = hf_hub_download(
+    repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    filename="qwen2.5-0.5b-instruct-q4_k_m.gguf"
+)
+print(f"[+] Модель скачана: {model_path}", flush=True)
 
-app = FastAPI(title="Capsule Assistant Backend")
+print("[*] Загрузка Qwen 2.5 в оперативную память (2 потока CPU)...", flush=True)
+llm = Llama(
+    model_path=model_path,
+    n_ctx=2048,
+    n_threads=2,
+    verbose=False
+)
+print("[+] Qwen 2.5 0.5B успешно загружен в память! Никаких внешних API.", flush=True)
+
+app = FastAPI(title="Capsule Assistant Local Backend")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
-app.include_router(stream_router)
 
 SYSTEM_INSTRUCTION = (
-    "Ты — Сима, умный голосовой ассистент смарт-колонки в Новороссийске. "
-    "Отвечай строго на русском языке! "
-    "Если пользователь просто общается или задает вопрос — отвечай полно, интересно и живо (2-3 предложения). "
-    "ВАЖНО: Если пользователь отдает команду (музыка, громкость, лайк), верни ответ СТРОГО в формате JSON без markdown: "
-    "1. Включить личный плейлист (мой плейлист, моя музыка, мои треки, любимое): "
-    "{\"action\": \"music\", \"cmd\": \"my_playlist\", \"reply\": \"Включаю твой плейлист из Саундклауда\"} "
-    "2. Включить трек/жанр (включи фонк, поставь рок, включи песню X): "
-    "{\"action\": \"music\", \"cmd\": \"play\", \"query\": \"название_или_жанр\", \"reply\": \"Включаю трек\"} "
-    "3. Управление треком: "
-    "{\"action\": \"music\", \"cmd\": \"next\", \"reply\": \"Следующий трек\"} "
-    "{\"action\": \"music\", \"cmd\": \"prev\", \"reply\": \"Предыдущий трек\"} "
-    "{\"action\": \"music\", \"cmd\": \"like\", \"reply\": \"Добавила в твои лайки\"} "
-    "{\"action\": \"music\", \"cmd\": \"pause\", \"reply\": \"Музыка на паузе\"} "
-    "{\"action\": \"music\", \"cmd\": \"resume\", \"reply\": \"Продолжаю воспроизведение\"} "
-    "4. Громкость: {\"action\": \"volume\", \"value\": 70, \"reply\": \"Громкость 70\"} или {\"action\": \"volume\", \"delta\": \"+15\", \"reply\": \"Прибавила\"} "
-    "Если это обычный вопрос без команд — отвечай просто чистым текстом."
+    "Ты — Сима, умный голосовой ассистент смарт-колонки. Твой хозяин живет в городе Новороссийск. "
+    "Отвечай строго на русском языке кратко, живо и по делу (2-3 предложения). "
+    "Если пользователь отдает команду управления (музыка или громкость), верни строго валидный JSON без лишнего текста вокруг: "
+    'Громкость: {"action": "volume", "value": 70, "reply": "Громкость 70"} или {"action": "volume", "delta": "+15", "reply": "Прибавила"} '
+    'Включить плейлист: {"action": "music", "cmd": "my_playlist", "reply": "Включаю твой плейлист"} '
+    'Включить трек/жанр: {"action": "music", "cmd": "play", "query": "название_или_жанр", "reply": "Включаю"} '
+    'Управление: {"action": "music", "cmd": "next|prev|like|pause|resume", "reply": "Готово"} '
+    "Если это обычный вопрос или диалог — отвечай просто обычным текстом без JSON, кавычек и markdown."
 )
-
-CASCADE_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.8-flash"
-]
 
 file_counter = 0
 dialogue_history = []
@@ -86,22 +81,25 @@ def fetch_weather_report(city: str = "Novorossiysk") -> str:
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             data = resp.read().decode("utf-8").strip()
+            print(f"[+] Сводка погоды ({city}): '{data}'", flush=True)
             return data
-    except Exception:
+    except Exception as e:
+        print(f"[!] Ошибка wttr.in: {e}", flush=True)
         return ""
 
 
-def build_full_prompt(user_query: str) -> str:
+def build_chat_messages(user_query: str) -> list[dict]:
     global dialogue_history, last_interaction_time
     now = time.time()
 
     if now - last_interaction_time > 60.0:
         dialogue_history = []
-        print("[*] Контекст сброшен по таймауту (60с).", flush=True)
+        print("[*] Контекст сброшен по таймауту неактивности (60с).", flush=True)
 
     last_interaction_time = now
     q_lower = user_query.lower()
 
+    # RAG: подтягиваем живую погоду при вопросе о погоде
     weather_injection = ""
     if any(w in q_lower for w in ["погод", "градус", "дожд", "температур", "ветер", "тепло", "холод"]):
         target_city = "Novorossiysk"
@@ -109,24 +107,23 @@ def build_full_prompt(user_query: str) -> str:
         elif "питер" in q_lower or "петербург" in q_lower: target_city = "Saint Petersburg"
         w_data = fetch_weather_report(target_city)
         if w_data:
-            weather_injection = f"\n[АКТУАЛЬНАЯ ПОГОДА: {w_data}]"
+            weather_injection = f"\n[ФАКТИЧЕСКИЕ ДАННЫЕ О ПОГОДЕ: {w_data}]"
 
-    query_with_data = f"{user_query}{weather_injection}"
+    final_user_prompt = f"{user_query}{weather_injection}"
 
-    context_lines = []
+    messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
     for role, text in dialogue_history[-6:]:
-        prefix = "Пользователь:" if role == "user" else "Сима:"
-        context_lines.append(f"{prefix} {text}")
+        messages.append({"role": role, "content": text})
 
-    context_lines.append(f"Пользователь: {query_with_data}")
+    messages.append({"role": "user", "content": final_user_prompt})
     dialogue_history.append(("user", user_query))
 
-    return "\n".join(context_lines)
+    return messages
 
 
 def record_assistant_reply(reply_text: str):
     global dialogue_history
-    dialogue_history.append(("model", reply_text))
+    dialogue_history.append(("assistant", reply_text))
     if len(dialogue_history) > 8:
         dialogue_history = dialogue_history[-8:]
 
@@ -138,7 +135,7 @@ def local_stt(audio_bytes: bytes) -> str:
             io.BytesIO(audio_bytes),
             language="ru",
             beam_size=2,
-            initial_prompt="Разговорная русская речь, голосовой помощник Сима, трек, включи, музыка, саундклауд, плейлист, лайк, погода.",
+            initial_prompt="Разговорная русская речь, голосовой помощник Сима, трек, включи, музыка, саундклауд, погода.",
             vad_filter=False
         )
         text = " ".join([seg.text for seg in segments]).strip()
@@ -150,59 +147,35 @@ def local_stt(audio_bytes: bytes) -> str:
         return ""
 
 
-async def query_gemini_with_context(user_query: str) -> tuple[str, dict]:
-    if not client or not GEMINI_API_KEY:
-        return "В настройках сервера не указан API ключ.", {}
+def run_qwen_inference(messages: list[dict]) -> tuple[str, dict]:
+    """Синхронный запуск инференса Qwen 2.5 на процессоре."""
+    t0 = time.perf_counter()
+    response = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=250,
+        temperature=0.6,
+        top_p=0.9
+    )
+    raw_text = response["choices"][0]["message"]["content"].strip()
+    dt = time.perf_counter() - t0
+    print(f"[+] Qwen 2.5 0.5B ({dt:.2f}с): '{raw_text}'", flush=True)
 
-    full_prompt = build_full_prompt(user_query)
+    cmd_payload = {}
+    speech_text = raw_text
 
-    for model_name in CASCADE_MODELS:
-        t0 = time.perf_counter()
+    # Парсим JSON-команду, если модель её вернула
+    if "{" in raw_text and "}" in raw_text:
         try:
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model_name,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION,
-                        max_output_tokens=300,
-                        temperature=0.5,
-                    )
-                ),
-                timeout=8.0
-            )
+            start_idx = raw_text.find("{")
+            end_idx = raw_text.rfind("}") + 1
+            cmd_payload = json.loads(raw_text[start_idx:end_idx])
+            speech_text = cmd_payload.get("reply", "Готово")
+        except Exception:
+            pass
 
-            raw_text = getattr(response, "text", "")
-            if raw_text:
-                clean_text = " ".join(raw_text.split()).strip()
-                dt = time.perf_counter() - t0
-                print(f"[+] {model_name} ({dt:.2f}с): '{clean_text}'", flush=True)
-
-                cmd_payload = {}
-                speech_text = clean_text
-
-                if "{" in clean_text and "}" in clean_text:
-                    try:
-                        start_idx = clean_text.find("{")
-                        end_idx = clean_text.rfind("}") + 1
-                        parsed = json.loads(clean_text[start_idx:end_idx])
-                        cmd_payload = parsed
-                        speech_text = parsed.get("reply", "Готово")
-                    except Exception:
-                        pass
-
-                speech_text = speech_text.replace('"', '').replace("'", "").replace('\\', '').strip()
-                record_assistant_reply(speech_text)
-                return speech_text, cmd_payload
-
-        except asyncio.TimeoutError:
-            print(f"[!] Таймаут 8с на {model_name}. Переключаем...", flush=True)
-            continue
-        except Exception as e:
-            print(f"[!] Сбой {model_name}: {repr(e)}. Переключаем...", flush=True)
-            continue
-
-    return "Сервер задумался, спроси еще разок.", {}
+    speech_text = " ".join(speech_text.split()).replace('"', '').replace("'", "").replace('\\', '').strip()
+    record_assistant_reply(speech_text)
+    return speech_text, cmd_payload
 
 
 async def synthesize_voice(text: str, filename: str) -> bool:
@@ -216,7 +189,8 @@ async def synthesize_voice(text: str, filename: str) -> bool:
             await asyncio.wait_for(communicate.save(str(filepath)), timeout=15.0)
             if filepath.exists() and filepath.stat().st_size > 0:
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"[!] Ошибка озвучки ({voice}): {e}", flush=True)
             continue
     return False
 
@@ -224,7 +198,7 @@ async def synthesize_voice(text: str, filename: str) -> bool:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "capsule-server", "soundcloud": bool(sc.SOUNDCLOUD_AUTH_TOKEN)}
+    return {"status": "ok", "service": "capsule-server", "engine": "qwen2.5-0.5b-local"}
 
 
 @app.post("/voice")
@@ -238,6 +212,8 @@ async def voice_endpoint(file: UploadFile = File(...)):
             return {"silent": True, "text": "", "audio_ready": False}
 
         loop = asyncio.get_running_loop()
+
+        # 1. Распознавание речи
         recognized_text = await loop.run_in_executor(None, local_stt, audio_bytes)
 
         if not recognized_text or recognized_text in [".", "...", "!", "?"]:
@@ -245,9 +221,11 @@ async def voice_endpoint(file: UploadFile = File(...)):
             print(f"[+] Чистая тишина ({dt}с).", flush=True)
             return {"silent": True, "text": "", "audio_ready": False, "latency_sec": dt}
 
-        reply_text, cmd_payload = await query_gemini_with_context(recognized_text)
+        # 2. Инференс локального Qwen 2.5 в пуле потоков
+        messages = build_chat_messages(recognized_text)
+        reply_text, cmd_payload = await loop.run_in_executor(None, run_qwen_inference, messages)
 
-        # Обработка действий SoundCloud
+        # 3. Обработка SoundCloud
         music_response = {}
         if cmd_payload.get("action") == "music":
             cmd = cmd_payload.get("cmd")
@@ -280,6 +258,7 @@ async def voice_endpoint(file: UploadFile = File(...)):
             elif cmd == "resume":
                 music_response = {"action": "music_resume"}
 
+        # 4. Синтез речи
         file_counter = (file_counter % 10) + 1
         audio_filename = f"reply_{file_counter}.mp3"
 

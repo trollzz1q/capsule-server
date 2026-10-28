@@ -1,3 +1,4 @@
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 fastapi
 uvicorn[standard]
 gunicorn
@@ -5,8 +6,7 @@ python-multipart
 websockets
 aiofiles
 python-dotenv
-google-genai
 faster-whisper
 edge-tts
 yt-dlp
-imageio-ffmpeg
+llama-cpp-python
